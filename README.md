@@ -1,5 +1,7 @@
 # Tile blueprints
 
+![Tile blueprints](preview.png)
+
 An [Omarchy](https://omarchy.org) editor for **per-workspace tiling layouts**. Draw the tiles
 for a workspace, say which app lives in each one, and from then on those apps open
 straight into their tile at the proportions you set.
@@ -43,7 +45,7 @@ The editor opens on the workspace you are on, drawn in your screen's proportions
 | drag a divider | set the split with the mouse |
 | arrows / `hjkl`, `Tab` | select a tile |
 | `A` / `Enter` / double-click | add an app to the tile (running apps first) |
-| `Backspace`, or click a chip's `×` | take the last app out |
+| `Backspace`, or an app's `×` | take the last app out, or that one |
 | `C` | **capture**: build the blueprint from the windows on this workspace |
 | `P` | pin: the apps always open on this workspace |
 | `O` | open these apps at login |
