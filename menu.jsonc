@@ -1,0 +1,25 @@
+  "setup.tile-blueprints": {
+    "icon": "󰕴",
+    "label": "Tile blueprints",
+    "aliases": ["tiling", "tiles", "layout", "blueprint", "workspace layout", "arrange"]
+  },
+  "setup.tile-blueprints.open": {
+    "icon": "󰕴",
+    "label": "Edit blueprints",
+    "action": "omarchy-shell shell toggle reidenxerx.tile-blueprints '{}'"
+  },
+  "setup.tile-blueprints.arrange": {
+    "icon": "󰁨",
+    "label": "Arrange apps now",
+    "action": "@PLUGIN_BIN@/tile-blueprints arrange"
+  },
+  "setup.tile-blueprints.status": {
+    "icon": "󰄭",
+    "label": "Show blueprints",
+    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/tile-blueprints status"
+  },
+  "setup.tile-blueprints.remove": {
+    "icon": "󰆴",
+    "label": "Turn blueprints off",
+    "action": "@PLUGIN_BIN@/tile-blueprints remove"
+  },

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "reidenxerx.tile-blueprints",
+  "name": "Tile blueprints",
+  "version": "1.0.0",
+  "author": "ReidenXerx",
+  "license": "MIT",
+  "description": "Draw a tiling layout for each workspace and tell each tile which app lives there. Apps open straight into their tile at the proportions you set, launch at login if you like, and a hand-arranged workspace can be captured as a blueprint in one key.",
+  "kinds": ["overlay"],
+  "keepLoaded": false,
+  "entryPoints": { "overlay": "TileBlueprints.qml" }
+}

@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Helper for the Tile blueprints plugin.
+
+  tile-blueprints open               show the editor
+  tile-blueprints write <json>       save blueprints (atomic), then apply them
+  tile-blueprints apply              regenerate the Hyprland layout file, reload, arrange
+  tile-blueprints arrange            move running apps to the workspaces they are pinned to
+  tile-blueprints windows <ws>       tiled windows on a workspace, as JSON (for capture)
+  tile-blueprints apps               apps to assign: running windows and installed apps, JSON
+  tile-blueprints status             what is configured and whether Hyprland has it
+  tile-blueprints remove             delete the generated layout file and reload
+
+Blueprints live in ~/.config/omarchy/tile-blueprints.json. `apply` turns them into
+~/.local/state/omarchy/workspace-layouts/zz-tile-blueprints.lua, a folder Omarchy already
+loads on every Hyprland start and reload, so nothing in your hypr config is edited.
+"""
+import configparser
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+PLUGIN_ID = "reidenxerx.tile-blueprints"
+PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
+ENGINE = PLUGIN_DIR / "lua" / "tiles-engine.lua"
+HOME = pathlib.Path.home()
+CONFIG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "omarchy" / "tile-blueprints.json"
+STATE = pathlib.Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "omarchy"
+GENERATED = STATE / "workspace-layouts" / "zz-tile-blueprints.lua"
+LAYOUT_NAME = "tile-blueprints"
+
+APP_DIRS = [
+    HOME / ".local/share/applications",
+    HOME / ".local/share/flatpak/exports/share/applications",
+    pathlib.Path("/var/lib/flatpak/exports/share/applications"),
+    pathlib.Path("/usr/local/share/applications"),
+    pathlib.Path("/usr/share/applications"),
+]
+
+
+def fail(msg, code=1):
+    print(f"tile-blueprints: {msg}", file=sys.stderr)
+    return code
+
+
+def notify(summary, body=""):
+    subprocess.run(["notify-send", "-a", "Tile blueprints", summary, body], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def hypr_json(*args):
+    try:
+        r = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True, timeout=5)
+        return json.loads(r.stdout) if r.returncode == 0 else []
+    except Exception:
+        return []
+
+
+# ------------------------------------------------------------------ config
+
+def load_config():
+    try:
+        data = json.loads(CONFIG.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"version": 1, "workspaces": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("workspaces"), dict):
+        return {"version": 1, "workspaces": {}}
+    return data
+
+
+def write_config(data):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    tmp.replace(CONFIG)
+
+
+def workspaces(data):
+    """Validated (workspace, blueprint) pairs, workspace ids ascending."""
+    out = []
+    for key, ws in (data.get("workspaces") or {}).items():
+        if not re.fullmatch(r"[0-9]+", str(key)) or not isinstance(ws, dict) or not isinstance(ws.get("root"), dict):
+            continue
+        out.append((str(key), ws))
+    return sorted(out, key=lambda kv: int(kv[0]))
+
+
+def leaves(node):
+    if isinstance(node.get("children"), list):
+        for child in node["children"]:
+            if isinstance(child, dict):
+                yield from leaves(child)
+    else:
+        yield node
+
+
+def apps_of(root):
+    for leaf in leaves(root):
+        for app in leaf.get("apps") or []:
+            if isinstance(app, dict) and app.get("class"):
+                yield app
+
+
+# ------------------------------------------------------------------ Lua generation
+
+def lua_str(s):
+    s = str(s)
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r") + '"'
+
+
+def lua_value(v, indent=""):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(float(v)) if isinstance(v, float) else str(v)
+    if isinstance(v, str):
+        return lua_str(v)
+    if isinstance(v, list):
+        inner = indent + "  "
+        return "{\n" + "".join(f"{inner}{lua_value(x, inner)},\n" for x in v) + indent + "}"
+    if isinstance(v, dict):
+        inner = indent + "  "
+        return "{\n" + "".join(f"{inner}[{lua_str(k)}] = {lua_value(x, inner)},\n" for k, x in v.items()) + indent + "}"
+    return "nil"
+
+
+def engine_tree(node):
+    """Only what the layout engine reads: dir, sizes, children, apps as class names."""
+    if isinstance(node.get("children"), list):
+        kids = [c for c in node["children"] if isinstance(c, dict)]
+        sizes = [float(x) for x in (node.get("sizes") or [])][:len(kids)]
+        return {"dir": "v" if node.get("dir") == "v" else "h", "sizes": sizes,
+                "children": [engine_tree(c) for c in kids]}
+    return {"name": str(node.get("id") or ""), "apps": [str(a["class"]) for a in node.get("apps") or []
+                                                          if isinstance(a, dict) and a.get("class")]}
+
+
+def class_regex(cls):
+    return "^" + re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", cls) + "$"
+
+
+def generate(data):
+    engine = ENGINE.read_text(encoding="utf-8")
+    pairs = workspaces(data)
+    lines = [
+        f"-- Generated by {PLUGIN_ID}. Edit blueprints in the Tile blueprints editor;",
+        "-- this file is rewritten on every save.",
+        "",
+        "local engine = (function()",
+        engine.rstrip(),
+        "end)()",
+        "",
+        "__omarchy_tiles = { workspaces = " + lua_value({k: engine_tree(ws["root"]) for k, ws in pairs}) + " }",
+        "",
+        f'hl.layout.register({lua_str(LAYOUT_NAME)}, {{',
+        "  recalculate = function(ctx) return engine.recalculate(ctx) end,",
+        "  layout_msg = function(ctx, msg) return engine.layout_msg(ctx, msg) end,",
+        "})",
+        "",
+    ]
+    launches = []
+    for key, ws in pairs:
+        lines.append(f'hl.workspace_rule({{ workspace = {lua_str(key)}, layout = {lua_str("lua:" + LAYOUT_NAME)} }})')
+        for app in apps_of(ws["root"]):
+            if ws.get("pin", True):
+                lines.append(f'hl.window_rule({{ match = {{ class = {lua_str(class_regex(app["class"]))} }}, '
+                             f'workspace = {lua_str(key + " silent")} }})')
+            desktop = str(app.get("desktop") or "")
+            if ws.get("launch", True) and re.fullmatch(r"[A-Za-z0-9._+-]+", desktop):
+                launches.append(f"uwsm-app -- gtk-launch {desktop}.desktop")
+    if launches:
+        lines += ["", 'hl.on("hyprland.start", function()']
+        lines += [f"  hl.exec_cmd({lua_str(cmd)})" for cmd in launches]
+        lines += ["end)"]
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_open(_args):
+    return subprocess.run(["omarchy-shell", "shell", "toggle", PLUGIN_ID, "{}"], check=False).returncode
+
+
+def cmd_write(args):
+    if not args:
+        return fail("write needs JSON", 2)
+    try:
+        data = json.loads(args[0])
+    except ValueError:
+        return fail("write: not valid JSON", 2)
+    if not isinstance(data, dict) or not isinstance(data.get("workspaces"), dict):
+        return fail("write: expected {\"workspaces\": {...}}", 2)
+    write_config(data)
+    return cmd_apply([])
+
+
+def cmd_apply(_args):
+    data = load_config()
+    if not workspaces(data):
+        return cmd_remove([], quiet=True)
+    GENERATED.parent.mkdir(parents=True, exist_ok=True)
+    tmp = GENERATED.with_suffix(".lua.tmp")
+    tmp.write_text(generate(data), encoding="utf-8")
+    tmp.replace(GENERATED)
+    subprocess.run(["hyprctl", "reload"], capture_output=True, check=False)
+    errors = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True, check=False).stdout.strip()
+    related = [line for line in errors.splitlines() if "tile" in line.lower() or "blueprint" in line.lower()]
+    if related:
+        notify("Tile blueprints could not be applied", "\n".join(related[:3]))
+        return fail("Hyprland reported: " + " | ".join(related))
+    moved = arrange(data)
+    count = len(workspaces(data))
+    notify("Tile blueprints applied",
+           f"{count} workspace{'s' if count != 1 else ''}" + (f", moved {moved} window{'s' if moved != 1 else ''}" if moved else ""))
+    print(f"Applied {count} blueprint(s); moved {moved} window(s).")
+    return 0
+
+
+def arrange(data):
+    pinned = {}
+    for key, ws in workspaces(data):
+        if not ws.get("pin", True):
+            continue
+        for app in apps_of(ws["root"]):
+            pinned.setdefault(str(app["class"]).lower(), key)
+    moved = 0
+    for client in hypr_json("clients"):
+        target = pinned.get(str(client.get("class", "")).lower())
+        ws = client.get("workspace") or {}
+        if not target or str(ws.get("id")) == target or client.get("floating") or ws.get("id", 0) < 0:
+            continue
+        expr = (f'hl.dsp.window.move({{ workspace = "{target}", follow = false, '
+                f'window = "address:{client.get("address")}" }})')
+        if subprocess.run(["hyprctl", "dispatch", expr], capture_output=True, check=False).returncode == 0:
+            moved += 1
+    return moved
+
+
+def cmd_arrange(_args):
+    moved = arrange(load_config())
+    print(f"Moved {moved} window(s).")
+    return 0
+
+
+def cmd_remove(_args, quiet=False):
+    existed = GENERATED.exists()
+    GENERATED.unlink(missing_ok=True)
+    if existed:
+        subprocess.run(["hyprctl", "reload"], capture_output=True, check=False)
+    if not quiet:
+        print("Removed the generated layout file." if existed else "Nothing to remove.")
+    return 0
+
+
+# ------------------------------------------------------------------ discovery
+
+def desktop_entries():
+    """Installed apps keyed by desktop id, first directory wins (user over system)."""
+    entries = {}
+    for directory in APP_DIRS:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.desktop")):
+            desktop_id = path.stem
+            if desktop_id in entries:
+                continue
+            parser = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                parser.read(path, encoding="utf-8")
+                entry = parser["Desktop Entry"]
+            except Exception:
+                continue
+            if entry.get("Type", "Application") != "Application" or entry.get("NoDisplay", "false").lower() == "true":
+                continue
+            if entry.get("Hidden", "false").lower() == "true":
+                continue
+            entries[desktop_id] = {
+                "desktop": desktop_id,
+                "name": entry.get("Name", desktop_id),
+                "icon": entry.get("Icon", ""),
+                "wmclass": entry.get("StartupWMClass", ""),
+            }
+    return entries
+
+
+def class_index(entries):
+    index = {}
+    for e in entries.values():
+        for key in (e["wmclass"], e["desktop"], e["desktop"].split(".")[-1] if "." in e["desktop"] else ""):
+            if key:
+                index.setdefault(key.lower(), e)
+    return index
+
+
+def cmd_apps(_args):
+    entries = desktop_entries()
+    index = class_index(entries)
+    out, seen = [], set()
+    for client in hypr_json("clients"):
+        cls = str(client.get("class") or "")
+        if not cls or cls.lower() in seen:
+            continue
+        seen.add(cls.lower())
+        e = index.get(cls.lower())
+        out.append({"class": cls, "name": e["name"] if e else cls, "desktop": e["desktop"] if e else "",
+                    "icon": e["icon"] if e else "", "running": True})
+    for e in sorted(entries.values(), key=lambda x: x["name"].lower()):
+        cls = e["wmclass"] or e["desktop"]
+        if cls.lower() in seen:
+            continue
+        seen.add(cls.lower())
+        out.append({"class": cls, "name": e["name"], "desktop": e["desktop"], "icon": e["icon"], "running": False})
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+def cmd_windows(args):
+    if not args or not args[0].isdigit():
+        return fail("windows needs a workspace number", 2)
+    ws = int(args[0])
+    index = class_index(desktop_entries())
+    out = []
+    for c in hypr_json("clients"):
+        if (c.get("workspace") or {}).get("id") != ws or c.get("floating") or not c.get("mapped", True) or c.get("hidden"):
+            continue
+        (x, y), (w, h) = c.get("at", [0, 0]), c.get("size", [0, 0])
+        cls = str(c.get("class") or "")
+        e = index.get(cls.lower())
+        out.append({"class": cls, "name": e["name"] if e else cls, "desktop": e["desktop"] if e else "",
+                    "x": x, "y": y, "w": w, "h": h})
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+def cmd_status(_args):
+    data = load_config()
+    pairs = workspaces(data)
+    if not pairs:
+        print("No blueprints configured.")
+    for key, ws in pairs:
+        apps = [a.get("name") or a["class"] for a in apps_of(ws["root"])]
+        tiles = sum(1 for _ in leaves(ws["root"]))
+        print(f"workspace {key}: {tiles} tile(s), apps: {', '.join(apps) or 'none'}"
+              f"{'' if ws.get('pin', True) else ' · not pinned'}{'' if ws.get('launch', True) else ' · no login launch'}")
+    live = {str(w.get("id")): w.get("tiledLayout") for w in hypr_json("workspaces")}
+    for key, _ in pairs:
+        if key in live:
+            print(f"  workspace {key} is open, layout: {live[key]}")
+    print(f"generated file: {'present' if GENERATED.exists() else 'absent'} ({GENERATED})")
+    return 0
+
+
+COMMANDS = {
+    "open": cmd_open, "write": cmd_write, "apply": cmd_apply, "arrange": cmd_arrange,
+    "windows": cmd_windows, "apps": cmd_apps, "status": cmd_status, "remove": cmd_remove,
+}
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if len(argv) >= 2 else 2
+    fn = COMMANDS.get(argv[1])
+    return fn(argv[2:]) if fn else fail(f"unknown command: {argv[1]}", 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
