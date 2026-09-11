@@ -16,9 +16,20 @@ Item {
   property var manifest: null
   property bool opened: false
 
+  // The helper runs under the system interpreter by absolute path, never through PATH.
+  // It reads and writes every file and runs every program; this file only talks to it.
+  readonly property string python: "/usr/bin/python3"
   readonly property string helper: localPath("bin/tile-blueprints")
-  readonly property string configPath: (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config"))
-    + "/omarchy/tile-blueprints.json"
+
+  // Ceilings on what the editor accepts back (the helper bounds its own output well
+  // below these) and on what it hands over. The tile limits match the helper's.
+  readonly property int maxHelperOutput: 4 * 1024 * 1024
+  readonly property int maxDocument: 512 * 1024
+  readonly property int maxApps: 3000
+  readonly property int maxWindows: 256
+  readonly property int maxTiles: 64
+  readonly property int maxAppsPerTile: 32
+  readonly property int maxDepth: 16
 
   function localPath(rel) {
     return decodeURIComponent(String(Qt.resolvedUrl(rel)).replace("file://", ""))
@@ -46,6 +57,13 @@ Item {
   property bool confirmDiscard: false
   property string status: ""
 
+  // The saved blueprints arrive from the helper; nothing is saved before they have.
+  property bool configLoaded: false
+  property string configError: ""
+  property bool saving: false
+  property string pendingSave: ""
+  property bool closeAfterSave: false
+
   property var apps: []
   property bool pickerOpen: false
   property string pickerQuery: ""
@@ -60,17 +78,23 @@ Item {
 
   function open(payloadJson) {
     var payload = {}
-    try { payload = JSON.parse(payloadJson || "{}") || {} } catch (e) { payload = {} }
+    var raw = String(payloadJson || "{}")
+    if (raw.length <= 4096) {
+      try { payload = JSON.parse(raw) || {} } catch (e) { payload = {} }
+    }
     root.opened = true
-    configFile.reload()
+    root.configLoaded = false
     root.draft = Model.clone(root.saved)
     root.dirty = false
     root.confirmDiscard = false
+    root.closeAfterSave = false
     root.pickerOpen = false
     root.status = ""
-    if (Number(payload.workspace) >= 1) root.showWorkspace(Number(payload.workspace))
-    else { root.showWorkspace(root.workspace); activeWorkspaceProc.running = true }
-    appsProc.running = true
+    var requested = Math.floor(Number(payload.workspace))
+    if (requested >= 1 && requested <= 10) root.showWorkspace(requested)
+    else { root.showWorkspace(root.workspace); root.runHelper(activeWorkspaceProc, activeWorkspaceWatchdog, ["active-workspace"]) }
+    root.runHelper(configProc, configWatchdog, ["config"])
+    root.runHelper(appsProc, appsWatchdog, ["apps"])
     Qt.callLater(function() { keys.forceActiveFocus() })
   }
 
@@ -90,54 +114,166 @@ Item {
     else root.open("{}")
   }
 
-  // ---------------------------------------------------------------- data
+  // ---------------------------------------------------------------- helper
 
-  FileView {
-    id: configFile
-    path: root.configPath
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.loadSaved(text())
-    onLoadFailed: root.loadSaved("")
+  // Stops a helper that overruns: SIGTERM, then SIGKILL two seconds later. The helper puts
+  // shorter deadlines on everything it runs, so this only fires if it hangs.
+  component Watchdog: Timer {
+    property var target: null
+    property int limit: 15000
+    property bool terminating: false
+    property bool fired: false
+    repeat: false
+
+    function arm() {
+      terminating = false
+      fired = false
+      interval = limit
+      restart()
+    }
+
+    // True when the process ended on its own, before the watchdog fired.
+    function finish() {
+      stop()
+      var inTime = !fired
+      terminating = false
+      fired = false
+      return inTime
+    }
+
+    onTriggered: {
+      if (!target || !target.running) return
+      fired = true
+      if (!terminating) {
+        terminating = true
+        target.signal(15)
+        interval = 2000
+        restart()
+      } else {
+        target.signal(9)
+      }
+    }
   }
+
+  function runHelper(proc, watchdog, args) {
+    if (proc.running) return false
+    proc.command = [root.python, root.helper].concat(args)
+    proc.running = true
+    watchdog.arm()
+    return true
+  }
+
+  // Call once per exit: it also disarms the watchdog.
+  function helperOk(watchdog, exitCode, exitStatus) {
+    return watchdog.finish() && exitCode === 0 && Number(exitStatus || 0) === 0
+  }
+
+  function helperText(collector) {
+    var text = String(collector.text || "")
+    return text.length <= root.maxHelperOutput ? text : ""
+  }
+
+  function helperError(collector, fallback) {
+    var line = String(collector.text || "").slice(0, 1024).split("\n")[0].replace(/^tile-blueprints: /, "")
+    return line !== "" ? line.slice(0, 200) : fallback
+  }
+
+  // ---------------------------------------------------------------- data
 
   function loadSaved(raw) {
     var parsed = null
     try { parsed = raw ? JSON.parse(raw) : null } catch (e) { parsed = null }
     root.saved = Model.normalizeFile(parsed)
-    if (!root.dirty) {
+    // Until the first load the draft is only a placeholder, so it is replaced even if touched.
+    if (!root.dirty || !root.configLoaded) {
       root.draft = Model.clone(root.saved)
+      root.dirty = false
       root.showWorkspace(root.workspace)
     }
+    root.configLoaded = true
+    var problems = parsed && Array.isArray(parsed.problems) ? parsed.problems : []
+    if (problems.length > 0 && root.status === "")
+      root.status = "Skipped part of the saved blueprints: " + String(problems[0]).slice(0, 200)
   }
+
+  Process {
+    id: configProc
+    stdout: StdioCollector { id: configOut; waitForEnd: true }
+    stderr: StdioCollector { id: configErr; waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      var ok = root.helperOk(configWatchdog, exitCode, exitStatus)
+      var text = ok ? root.helperText(configOut) : ""
+      if (text !== "") {
+        root.configError = ""
+        root.loadSaved(text)
+      } else {
+        root.configError = root.helperError(configErr, "the helper did not finish")
+        root.status = "Could not read the saved blueprints: " + root.configError
+      }
+    }
+  }
+  Watchdog { id: configWatchdog; target: configProc; limit: 10000 }
 
   Process {
     id: appsProc
-    command: [root.helper, "apps"]
-    stdout: StdioCollector {
-      onStreamFinished: {
-        try { root.apps = JSON.parse(text) || [] } catch (e) { root.apps = [] }
+    stdout: StdioCollector { id: appsOut; waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      var list = []
+      if (root.helperOk(appsWatchdog, exitCode, exitStatus)) {
+        try { list = JSON.parse(root.helperText(appsOut)) } catch (e) { list = [] }
       }
+      root.apps = Array.isArray(list) ? list.slice(0, root.maxApps) : []
     }
   }
+  Watchdog { id: appsWatchdog; target: appsProc; limit: 20000 }
 
   Process {
     id: activeWorkspaceProc
-    command: ["hyprctl", "-j", "activeworkspace"]
-    stdout: StdioCollector {
-      onStreamFinished: {
-        var ws = null
-        try { ws = JSON.parse(text) } catch (e) { ws = null }
-        if (ws && Number(ws.id) >= 1 && Number(ws.id) <= 10) root.showWorkspace(Number(ws.id))
-      }
+    stdout: StdioCollector { id: activeWorkspaceOut; waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      if (!root.helperOk(activeWorkspaceWatchdog, exitCode, exitStatus)) return
+      var ws = null
+      try { ws = JSON.parse(root.helperText(activeWorkspaceOut)) } catch (e) { ws = null }
+      var id = ws ? Number(ws.id) : NaN
+      if (id >= 1 && id <= 10 && Math.floor(id) === id) root.showWorkspace(id)
     }
   }
+  Watchdog { id: activeWorkspaceWatchdog; target: activeWorkspaceProc; limit: 10000 }
 
   Process {
     id: captureProc
-    stdout: StdioCollector { onStreamFinished: root.finishCapture(text) }
+    property int targetWorkspace: 0
+    stdout: StdioCollector { id: captureOut; waitForEnd: true }
+    stderr: StdioCollector { id: captureErr; waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      if (root.helperOk(captureWatchdog, exitCode, exitStatus))
+        root.finishCapture(root.helperText(captureOut), captureProc.targetWorkspace)
+      else
+        root.status = "Could not capture: " + root.helperError(captureErr, "the helper did not finish")
+    }
   }
+  Watchdog { id: captureWatchdog; target: captureProc; limit: 20000 }
+
+  // The document goes to the helper on stdin, never in argv. It is one line because
+  // Process.write() cannot close stdin; the helper reads up to the newline.
+  Process {
+    id: saveProc
+    property string payload: ""
+    stdinEnabled: true
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { id: saveErr; waitForEnd: true }
+    onStarted: {
+      saveProc.write(saveProc.payload + "\n")
+      saveProc.payload = ""
+    }
+    onExited: function(exitCode, exitStatus) {
+      var ok = root.helperOk(saveWatchdog, exitCode, exitStatus)
+      root.finishSave(ok, ok ? "" : root.helperError(saveErr, "the helper did not finish"))
+    }
+  }
+  Watchdog { id: saveWatchdog; target: saveProc; limit: 20000 }
 
   // ---------------------------------------------------------------- edits
 
@@ -164,8 +300,30 @@ Item {
     root.commit(ws, nextSelected, message)
   }
 
+  // Split levels of a tree (a lone tile is 0), for the helper's depth limit.
+  function treeDepth(node) {
+    if (Model.isLeaf(node)) return 0
+    var deepest = 0
+    for (var i = 0; i < node.children.length; i++) deepest = Math.max(deepest, root.treeDepth(node.children[i]))
+    return deepest + 1
+  }
+
+  // Why the helper would refuse this tree, or "". Checked before an edit lands so a
+  // blueprint never grows past what can be saved.
+  function limitProblem(tree) {
+    var tiles = Model.leaves(tree)
+    if (tiles.length > root.maxTiles) return "a blueprint holds at most " + root.maxTiles + " tiles"
+    if (root.treeDepth(tree) > root.maxDepth) return "splits nest at most " + root.maxDepth + " levels deep"
+    for (var i = 0; i < tiles.length; i++) {
+      if (tiles[i].apps.length > root.maxAppsPerTile) return "a tile holds at most " + root.maxAppsPerTile + " apps"
+    }
+    return ""
+  }
+
   function splitSelected(dir) {
     var r = Model.split(root.current.root, root.selected, dir)
+    var problem = root.limitProblem(r.root)
+    if (problem) { root.status = "Cannot split: " + problem; return }
     root.editRoot(r.root, r.id)
   }
 
@@ -191,8 +349,15 @@ Item {
 
   function assignApp(app) {
     if (!app) return
-    root.editRoot(Model.assign(root.current.root, root.selected, app), root.selected,
-                  (app.name || app["class"]) + " now opens in this tile")
+    var next = Model.assign(root.current.root, root.selected, app)
+    var problem = root.limitProblem(next)
+    if (problem) {
+      root.status = "Cannot add: " + problem
+      root.pickerOpen = false
+      keys.forceActiveFocus()
+      return
+    }
+    root.editRoot(next, root.selected, (app.name || app["class"]) + " now opens in this tile")
     root.pickerOpen = false
     keys.forceActiveFocus()
   }
@@ -219,14 +384,23 @@ Item {
   }
 
   function startCapture() {
+    if (captureProc.running) return
+    captureProc.targetWorkspace = root.workspace
     root.status = "Capturing workspace " + root.workspace + "…"
-    captureProc.command = [root.helper, "windows", String(root.workspace)]
-    captureProc.running = true
+    root.runHelper(captureProc, captureWatchdog, ["windows", String(root.workspace)])
   }
 
-  function finishCapture(raw) {
+  function finishCapture(raw, capturedWorkspace) {
+    if (capturedWorkspace !== root.workspace) { root.status = ""; return }
+    var parsed = []
+    try { parsed = JSON.parse(raw) } catch (e) { parsed = [] }
     var windows = []
-    try { windows = JSON.parse(raw) || [] } catch (e) { windows = [] }
+    for (var n = 0; Array.isArray(parsed) && n < parsed.length && windows.length < root.maxWindows; n++) {
+      var item = parsed[n]
+      if (!item || !isFinite(item.x) || !isFinite(item.y) || !(Number(item.w) > 0) || !(Number(item.h) > 0)) continue
+      windows.push({ "class": String(item["class"] || ""), name: String(item.name || ""), desktop: String(item.desktop || ""),
+                     x: Number(item.x), y: Number(item.y), w: Number(item.w), h: Number(item.h) })
+    }
     if (windows.length === 0) { root.status = "No tiled windows on workspace " + root.workspace + " to capture"; return }
     var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
     for (var i = 0; i < windows.length; i++) {
@@ -234,29 +408,78 @@ Item {
       minX = Math.min(minX, w.x); minY = Math.min(minY, w.y)
       maxX = Math.max(maxX, w.x + w.w); maxY = Math.max(maxY, w.y + w.h)
     }
-    var tree = Model.capture(windows, { x: minX, y: minY, w: maxX - minX, h: maxY - minY })
+    var tree = Model.normalize(Model.capture(windows, { x: minX, y: minY, w: maxX - minX, h: maxY - minY }))
+    var problem = root.limitProblem(tree)
+    if (problem) { root.status = "Cannot capture: " + problem; return }
     var ws = Model.clone(root.current)
-    ws.root = Model.normalize(tree)
+    ws.root = tree
     root.commit(ws, Model.order(ws.root)[0],
                 "Captured " + windows.length + " window" + (windows.length === 1 ? "" : "s") + " from workspace " + root.workspace)
   }
 
   function save() {
+    if (!root.configLoaded) {
+      root.status = root.configError !== "" ? "Not saved: could not read the saved blueprints: " + root.configError
+                                            : "Still reading the saved blueprints…"
+      return
+    }
     var out = { version: 1, workspaces: {} }
     for (var key in root.draft.workspaces) {
       if (Model.isMeaningful(root.draft.workspaces[key])) out.workspaces[key] = root.draft.workspaces[key]
     }
-    Quickshell.execDetached([root.helper, "write", JSON.stringify(out)])
+    var payload = JSON.stringify(out)
+    if (payload.length > root.maxDocument) { root.status = "Not saved: the blueprints are too large"; return }
     root.saved = Model.clone(out)
     root.draft = Model.clone(out)
     root.showWorkspace(root.workspace)
     root.dirty = false
     root.confirmDiscard = false
-    root.status = "Saved and applied"
+    root.status = "Saving…"
+    if (saveProc.running) root.pendingSave = payload
+    else root.startSave(payload)
+  }
+
+  function startSave(payload) {
+    saveProc.payload = payload
+    root.saving = true
+    if (!root.runHelper(saveProc, saveWatchdog, ["write", "--background"])) {
+      saveProc.payload = ""
+      root.saving = false
+      root.dirty = true
+      root.status = "Not saved: a save is still running, try again"
+    }
+  }
+
+  function finishSave(ok, error) {
+    root.saving = false
+    if (root.pendingSave !== "") {
+      var next = root.pendingSave
+      root.pendingSave = ""
+      root.saving = true
+      Qt.callLater(function() { root.startSave(next) })
+      return
+    }
+    if (!ok) {
+      // Keep the edits: they are still in the draft, now marked unsaved again.
+      root.dirty = true
+      root.closeAfterSave = false
+      root.status = "Not saved: " + error
+      root.runHelper(configProc, configWatchdog, ["config"])
+      return
+    }
+    root.status = "Saved and applying"
+    if (root.closeAfterSave) {
+      root.closeAfterSave = false
+      root.dismiss()
+    }
   }
 
   function requestClose() {
     if (root.pickerOpen) { root.pickerOpen = false; keys.forceActiveFocus(); return }
+    // Closing unloads this overlay and its processes, so wait for the save to be handed
+    // over. A second Esc closes anyway.
+    if (root.saving && !root.closeAfterSave) { root.closeAfterSave = true; root.status = "Closing once saved… (Esc again to close now)"; return }
+    if (root.saving) { root.dismiss(); return }
     if (root.dirty && !root.confirmDiscard) {
       root.confirmDiscard = true
       root.status = "Unsaved changes: Esc again to discard, Ctrl+S to save"
@@ -304,8 +527,9 @@ Item {
     var icon = String((info && info.icon) || (app && app.icon) || "")
     var library = root.shell && root.shell.appLibrary
     if (library && typeof library.iconSource === "function") return library.iconSource(icon)
-    if (icon.indexOf("file://") === 0 || icon.indexOf("image://") === 0) return icon
-    if (icon.charAt(0) === "/") return "file://" + icon
+    // The helper only hands out themed names and absolute paths it has checked are
+    // regular, size-capped image files owned by us under $HOME or by root.
+    if (icon.charAt(0) === "/") return Util.fileUrl(icon)
     var themed = icon ? Quickshell.iconPath(icon, true) : ""
     return themed || Quickshell.iconPath("application-x-executable", true)
   }

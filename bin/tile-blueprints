@@ -1,43 +1,120 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Helper for the Tile blueprints plugin.
 
-  tile-blueprints open               show the editor
-  tile-blueprints write <json>       save blueprints (atomic), then apply them
-  tile-blueprints apply              regenerate the Hyprland layout file, reload, arrange
-  tile-blueprints arrange            move running apps to the workspaces they are pinned to
-  tile-blueprints windows <ws>       tiled windows on a workspace, as JSON (for capture)
-  tile-blueprints apps               apps to assign: running windows and installed apps, JSON
-  tile-blueprints status             what is configured and whether Hyprland has it
-  tile-blueprints remove             delete the generated layout file and reload
+  tile-blueprints open                 show the editor
+  tile-blueprints config               the saved blueprints, validated, as JSON
+  tile-blueprints write [--background] save the blueprint document read from stdin (one line
+                                       of JSON), then apply it; --background hands the apply
+                                       to a bounded detached helper and returns at once
+  tile-blueprints apply                regenerate the Hyprland layout file, reload, arrange
+  tile-blueprints arrange              move running apps to the workspaces they are pinned to
+  tile-blueprints windows <ws>         tiled windows on a workspace, as JSON (for capture)
+  tile-blueprints apps                 apps to assign: running windows and installed apps, JSON
+  tile-blueprints active-workspace     the focused workspace id, as JSON
+  tile-blueprints status               what is configured and whether Hyprland has it
+  tile-blueprints remove               delete the generated layout file and reload
 
 Blueprints live in ~/.config/omarchy/tile-blueprints.json. `apply` turns them into
 ~/.local/state/omarchy/workspace-layouts/zz-tile-blueprints.lua, a folder Omarchy already
 loads on every Hyprland start and reload, so nothing in your hypr config is edited.
+
+The blueprint file is untrusted input: it is size-capped, validated and normalized before
+any Lua is generated, and every string reaches the Lua file as an escaped literal. Files go
+through plugin_safety (no symlinks, owner checks, caps, atomic writes) and programs run from
+/usr/bin with deadlines and output ceilings.
 """
 import configparser
 import json
+import math
 import os
 import pathlib
 import re
-import subprocess
+import select
+import stat
 import sys
+import time
+
+sys.dont_write_bytecode = True
+BIN_DIR = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN_DIR))
+import plugin_safety as safe  # noqa: E402
 
 PLUGIN_ID = "reidenxerx.tile-blueprints"
-PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
+PLUGIN_DIR = BIN_DIR.parent
+SELF = BIN_DIR / "tile-blueprints"
 ENGINE = PLUGIN_DIR / "lua" / "tiles-engine.lua"
-HOME = pathlib.Path.home()
-CONFIG = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "omarchy" / "tile-blueprints.json"
-STATE = pathlib.Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "omarchy"
+HOME = pathlib.Path(safe.home_dir())
+
+
+def _xdg(variable, default):
+    value = os.environ.get(variable, "")
+    return pathlib.Path(value) if value.startswith("/") else HOME / default
+
+
+CONFIG = _xdg("XDG_CONFIG_HOME", ".config") / "omarchy" / "tile-blueprints.json"
+STATE = _xdg("XDG_STATE_HOME", ".local/state") / "omarchy"
 GENERATED = STATE / "workspace-layouts" / "zz-tile-blueprints.lua"
 LAYOUT_NAME = "tile-blueprints"
 
-APP_DIRS = [
+# Desktop entries, first directory wins. The user's own are read through plugin_safety;
+# the system ones through read_system_data (root-owned package data only).
+USER_APP_DIRS = [
     HOME / ".local/share/applications",
     HOME / ".local/share/flatpak/exports/share/applications",
+]
+SYSTEM_APP_DIRS = [
     pathlib.Path("/var/lib/flatpak/exports/share/applications"),
     pathlib.Path("/usr/local/share/applications"),
     pathlib.Path("/usr/share/applications"),
 ]
+# Where a system desktop entry may really live. Flatpak exports are symlinks into
+# /var/lib/flatpak; some packages (LibreOffice) link their entries in from /usr/lib.
+SYSTEM_DATA_ROOTS = ("/usr/share/", "/usr/local/share/", "/usr/lib/", "/var/lib/flatpak/")
+SYSTEM_ICON_ROOTS = ("/usr/", "/opt/", "/var/lib/flatpak/")
+
+# ------------------------------------------------------------------ limits
+
+CONFIG_MAX = 512 * 1024           # blueprint file on disk
+STDIN_MAX = 512 * 1024            # document handed to `write`
+STDIN_TIMEOUT = 10.0              # ... which must arrive within this long
+ENGINE_MAX = 64 * 1024
+DESKTOP_FILE_MAX = 64 * 1024
+DIR_SCAN_MAX = 10000              # directory entries looked at per applications folder
+ICON_FILE_MAX = 4 * 1024 * 1024
+MAX_DESKTOP_ENTRIES = 3000
+MAX_APPS_OUT = 3000
+MAX_WINDOWS = 256
+OUTPUT_MAX = 2 * 1024 * 1024      # bytes of JSON a listing prints
+MAX_WORKSPACES = 10
+MAX_WORKSPACE_ID = 99
+MAX_TILES = 64                    # per workspace
+MAX_APPS_PER_TILE = 32
+MAX_DEPTH = 16                    # split levels
+MAX_TEXT = 256                    # class and name length
+MAX_PROBLEMS = 20
+MAX_COORDINATE = 1_000_000
+HYPR_TIMEOUT = 5.0
+HYPR_OUTPUT_MAX = 4 * 1024 * 1024
+RELOAD_TIMEOUT = 15.0
+ARRANGE_BUDGET = 20.0             # seconds for all the moves of one arrange
+APPLY_DEADLINE = 90               # hard deadline of the detached apply after `write --background`
+JSON_LIMITS = {"max_depth": 48, "max_items": 100000, "max_string": 4096}
+
+WORKSPACE_KEY = re.compile(r"[1-9][0-9]?")
+DESKTOP_ID = re.compile(r"[A-Za-z0-9._+-]{1,255}")
+LEAF_ID = re.compile(r"[A-Za-z0-9_-]{1,32}")
+ADDRESS = re.compile(r"0x[0-9a-fA-F]{1,16}")
+ICON_NAME = re.compile(r"[A-Za-z0-9._+@-]{1,255}")
+ICON_EXTENSIONS = (".png", ".svg", ".svgz", ".xpm")
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+class Invalid(ValueError):
+    """A blueprint document breaks a structural limit."""
+
+
+class Unreadable(Exception):
+    """The blueprint file exists but cannot be used (too large, not JSON, wrong shape)."""
 
 
 def fail(msg, code=1):
@@ -45,76 +122,261 @@ def fail(msg, code=1):
     return code
 
 
-def notify(summary, body=""):
-    subprocess.run(["notify-send", "-a", "Tile blueprints", summary, body], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+# ------------------------------------------------------------------ strings
+
+def _encodable(value):
+    try:
+        value.encode("utf-8")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def clean_text(value, limit=MAX_TEXT):
+    """A display string: control characters removed, at most limit characters."""
+    if not isinstance(value, str):
+        return ""
+    return CONTROL.sub("", value)[:limit].encode("utf-8", "replace").decode("utf-8")
+
+
+def valid_class(value):
+    return (isinstance(value, str) and 0 < len(value) <= MAX_TEXT
+            and not CONTROL.search(value) and _encodable(value))
+
+
+def valid_desktop(value):
+    # No leading dash: the id becomes an argument of gtk-launch.
+    return isinstance(value, str) and DESKTOP_ID.fullmatch(value) is not None and not value.startswith("-")
+
+
+# ------------------------------------------------------------------ programs
+
+def hyprctl(args, timeout=HYPR_TIMEOUT, max_output=HYPR_OUTPUT_MAX):
+    """Every hyprctl call: /usr/bin/hyprctl, a deadline, an output ceiling. None if it
+    could not run."""
+    try:
+        return safe.run(["hyprctl", *args], timeout=timeout, max_output=max_output)
+    except (safe.UnsafeError, OSError):
+        return None
 
 
 def hypr_json(*args):
+    r = hyprctl(["-j", *args], timeout=HYPR_TIMEOUT, max_output=HYPR_OUTPUT_MAX)
+    if r is None or not r.ok:
+        return None
     try:
-        r = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True, timeout=5)
-        return json.loads(r.stdout) if r.returncode == 0 else []
-    except Exception:
+        return safe.loads(r.stdout, max_depth=16, max_items=200000, max_string=1 << 16)
+    except (ValueError, UnicodeDecodeError, safe.TooLarge):
+        return None
+
+
+def clients():
+    data = hypr_json("clients")
+    if not isinstance(data, list):
         return []
+    return [c for c in data if isinstance(c, dict)][:MAX_WINDOWS]
+
+
+def notify(summary, body=""):
+    lines = [clean_text(line, 300) for line in str(body).splitlines()[:4]]
+    try:
+        safe.spawn(["notify-send", "-a", "Tile blueprints", "--", clean_text(summary, 200), "\n".join(lines)],
+                   timeout=10)
+    except (safe.UnsafeError, OSError):
+        pass
+
+
+def reload_hyprland():
+    hyprctl(["reload"], timeout=RELOAD_TIMEOUT, max_output=64 * 1024)
+
+
+def config_errors():
+    r = hyprctl(["configerrors"], timeout=HYPR_TIMEOUT, max_output=256 * 1024)
+    if r is None:
+        return []
+    related = [line for line in r.text().splitlines() if "tile" in line.lower() or "blueprint" in line.lower()]
+    return [clean_text(line, 300) for line in related[:3]]
 
 
 # ------------------------------------------------------------------ config
 
-def load_config():
+def empty_document():
+    return {"version": 1, "workspaces": {}}
+
+
+def _positive(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
     try:
-        data = json.loads(CONFIG.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {"version": 1, "workspaces": {}}
-    if not isinstance(data, dict) or not isinstance(data.get("workspaces"), dict):
-        return {"version": 1, "workspaces": {}}
-    return data
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) and number > 0 else None
 
 
-def write_config(data):
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
-    tmp.replace(CONFIG)
+def normalize_sizes(sizes, count):
+    raw = sizes if isinstance(sizes, list) else []
+    values = []
+    for i in range(count):
+        number = _positive(raw[i]) if i < len(raw) else None
+        values.append(min(max(number, 1e-6), 1e6) if number is not None else 1.0 / count)
+    total = sum(values)
+    return [v / total for v in values]
 
 
-def workspaces(data):
-    """Validated (workspace, blueprint) pairs, workspace ids ascending."""
-    out = []
-    for key, ws in (data.get("workspaces") or {}).items():
-        if not re.fullmatch(r"[0-9]+", str(key)) or not isinstance(ws, dict) or not isinstance(ws.get("root"), dict):
+def _normalize_tree(node, state, depth):
+    if depth > MAX_DEPTH:
+        raise Invalid(f"tiles nest deeper than {MAX_DEPTH} levels")
+    if not isinstance(node, dict):
+        node = {}
+    children = node.get("children")
+    if isinstance(children, list):
+        if len(children) > MAX_TILES:
+            raise Invalid(f"more than {MAX_TILES} tiles")
+        kids = [_normalize_tree(child, state, depth + 1) for child in children]
+        if len(kids) == 1:
+            return kids[0]
+        if kids:
+            return {"dir": "v" if node.get("dir") == "v" else "h",
+                    "sizes": normalize_sizes(node.get("sizes"), len(kids)), "children": kids}
+        node = {}
+    state["tiles"] += 1
+    if state["tiles"] > MAX_TILES:
+        raise Invalid(f"more than {MAX_TILES} tiles")
+    listed = node.get("apps") if isinstance(node.get("apps"), list) else []
+    if len(listed) > MAX_APPS_PER_TILE:
+        raise Invalid(f"a tile lists more than {MAX_APPS_PER_TILE} apps")
+    apps = []
+    for app in listed:
+        if not isinstance(app, dict) or not valid_class(app.get("class")):
             continue
-        out.append((str(key), ws))
-    return sorted(out, key=lambda kv: int(kv[0]))
+        cls = app["class"]
+        if cls.lower() in state["classes"]:
+            continue  # a class lives in one tile only, as in the editor
+        state["classes"].add(cls.lower())
+        desktop = app.get("desktop")
+        apps.append({"class": cls, "name": clean_text(app.get("name")) or cls,
+                     "desktop": desktop if valid_desktop(desktop) else ""})
+    leaf_id = node.get("id")
+    leaf = {"id": leaf_id if isinstance(leaf_id, str) and LEAF_ID.fullmatch(leaf_id) else None, "apps": apps}
+    state["leaves"].append(leaf)
+    return leaf
+
+
+def _assign_ids(leaves):
+    used = set()
+    for leaf in leaves:
+        if leaf["id"] in used:
+            leaf["id"] = None
+        elif leaf["id"] is not None:
+            used.add(leaf["id"])
+    numbers = [int(m.group(1)) for m in (re.fullmatch(r"t([0-9]{1,6})", i) for i in used) if m]
+    top = max(numbers, default=0)
+    for leaf in leaves:
+        if leaf["id"] is None:
+            top += 1
+            while f"t{top}" in used:
+                top += 1
+            leaf["id"] = f"t{top}"
+            used.add(leaf["id"])
+
+
+def normalize_workspace(ws):
+    if not isinstance(ws, dict) or not isinstance(ws.get("root"), dict):
+        raise Invalid("has no root tile")
+    state = {"tiles": 0, "classes": set(), "leaves": []}
+    root = _normalize_tree(ws["root"], state, 0)
+    _assign_ids(state["leaves"])
+    return {"root": root, "launch": ws.get("launch") is not False, "pin": ws.get("pin") is not False}
+
+
+def normalize_document(data, strict=False):
+    """(document, problems): only what passes every limit. strict (a save from the editor)
+    rejects the document at the first problem; otherwise a workspace that breaks a limit is
+    left out and reported."""
+    if not isinstance(data, dict) or not isinstance(data.get("workspaces"), dict):
+        raise Invalid('expected {"workspaces": {...}}')
+    out, problems = {}, []
+    for key, ws in data["workspaces"].items():
+        try:
+            if not WORKSPACE_KEY.fullmatch(key):
+                raise Invalid(f"workspace ids run from 1 to {MAX_WORKSPACE_ID}")
+            out[key] = normalize_workspace(ws)
+        except Invalid as e:
+            message = f"workspace {clean_text(key, 16)!r}: {e}"
+            if strict:
+                raise Invalid(message) from None
+            if len(problems) < MAX_PROBLEMS:
+                problems.append(message)
+    keys = sorted(out, key=int)
+    if len(keys) > MAX_WORKSPACES:
+        if strict:
+            raise Invalid(f"more than {MAX_WORKSPACES} workspaces")
+        problems.append(f"more than {MAX_WORKSPACES} workspaces; kept {', '.join(keys[:MAX_WORKSPACES])}")
+        keys = keys[:MAX_WORKSPACES]
+    return {"version": 1, "workspaces": {k: out[k] for k in keys}}, problems
+
+
+def load_config():
+    """(document, problems). A missing file is an empty document; an unsafe one (symlink,
+    foreign owner) raises UnsafeError; an oversized or malformed one raises Unreadable."""
+    try:
+        blob = safe.read_file(CONFIG, CONFIG_MAX)
+    except safe.TooLarge:
+        raise Unreadable(f"{CONFIG} is larger than {CONFIG_MAX // 1024} KB") from None
+    if blob is None:
+        return empty_document(), []
+    try:
+        return normalize_document(safe.loads(blob, **JSON_LIMITS))
+    except (ValueError, UnicodeDecodeError, safe.TooLarge):
+        raise Unreadable(f"{CONFIG} is not a valid blueprint file") from None
+
+
+def serialize_config(doc):
+    for options in ({"indent": 1}, {"separators": (",", ":")}):
+        blob = (json.dumps(doc, ensure_ascii=False, allow_nan=False, **options) + "\n").encode("utf-8")
+        if len(blob) <= CONFIG_MAX:
+            return blob
+    raise Invalid(f"blueprints exceed {CONFIG_MAX // 1024} KB")
+
+
+def workspaces(doc):
+    return sorted(doc["workspaces"].items(), key=lambda kv: int(kv[0]))
 
 
 def leaves(node):
-    if isinstance(node.get("children"), list):
+    if "children" in node:
         for child in node["children"]:
-            if isinstance(child, dict):
-                yield from leaves(child)
+            yield from leaves(child)
     else:
         yield node
 
 
 def apps_of(root):
     for leaf in leaves(root):
-        for app in leaf.get("apps") or []:
-            if isinstance(app, dict) and app.get("class"):
-                yield app
+        yield from leaf["apps"]
 
 
 # ------------------------------------------------------------------ Lua generation
 
-def lua_str(s):
-    s = str(s)
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r") + '"'
+_LUA_PLAIN = frozenset(range(0x20, 0x7F)) - {ord('"'), ord("\\")}
+
+
+def lua_str(value):
+    """A Lua string literal that can only ever be one string: printable ASCII other than
+    quote and backslash verbatim, every other byte (quotes, backslashes, newlines, NUL,
+    UTF-8) as a three-digit \\ddd escape."""
+    data = str(value).encode("utf-8", "replace")
+    return '"' + "".join(chr(b) if b in _LUA_PLAIN else f"\\{b:03d}" for b in data) + '"'
 
 
 def lua_value(v, indent=""):
     if isinstance(v, bool):
         return "true" if v else "false"
-    if isinstance(v, (int, float)):
-        return repr(float(v)) if isinstance(v, float) else str(v)
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return repr(v) if math.isfinite(v) else "0"
     if isinstance(v, str):
         return lua_str(v)
     if isinstance(v, list):
@@ -128,22 +390,35 @@ def lua_value(v, indent=""):
 
 def engine_tree(node):
     """Only what the layout engine reads: dir, sizes, children, apps as class names."""
-    if isinstance(node.get("children"), list):
-        kids = [c for c in node["children"] if isinstance(c, dict)]
-        sizes = [float(x) for x in (node.get("sizes") or [])][:len(kids)]
-        return {"dir": "v" if node.get("dir") == "v" else "h", "sizes": sizes,
-                "children": [engine_tree(c) for c in kids]}
-    return {"name": str(node.get("id") or ""), "apps": [str(a["class"]) for a in node.get("apps") or []
-                                                          if isinstance(a, dict) and a.get("class")]}
+    if "children" in node:
+        return {"dir": node["dir"], "sizes": list(node["sizes"]),
+                "children": [engine_tree(c) for c in node["children"]]}
+    return {"name": node["id"], "apps": [a["class"] for a in node["apps"]]}
 
 
 def class_regex(cls):
     return "^" + re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", cls) + "$"
 
 
-def generate(data):
-    engine = ENGINE.read_text(encoding="utf-8")
-    pairs = workspaces(data)
+def read_engine():
+    blob = safe.read_file(ENGINE, ENGINE_MAX)
+    if blob is None:
+        raise safe.UnsafeError(f"{ENGINE} is missing")
+    return blob.decode("utf-8")
+
+
+def launch_tools():
+    """Absolute uwsm-app and gtk-launch for the login launches, or None."""
+    try:
+        return safe.tool("uwsm-app"), safe.tool("gtk-launch")
+    except safe.UnsafeError:
+        return None
+
+
+def generate(doc):
+    """The Lua layout file for a normalized document."""
+    engine = read_engine()
+    pairs = [(k, ws) for k, ws in workspaces(doc) if WORKSPACE_KEY.fullmatch(k)]
     lines = [
         f"-- Generated by {PLUGIN_ID}. Edit blueprints in the Tile blueprints editor;",
         "-- this file is rewritten on every save.",
@@ -164,15 +439,19 @@ def generate(data):
     for key, ws in pairs:
         lines.append(f'hl.workspace_rule({{ workspace = {lua_str(key)}, layout = {lua_str("lua:" + LAYOUT_NAME)} }})')
         for app in apps_of(ws["root"]):
-            if ws.get("pin", True):
+            if not valid_class(app["class"]):
+                continue
+            if ws["pin"]:
                 lines.append(f'hl.window_rule({{ match = {{ class = {lua_str(class_regex(app["class"]))} }}, '
                              f'workspace = {lua_str(key + " silent")} }})')
-            desktop = str(app.get("desktop") or "")
-            if ws.get("launch", True) and re.fullmatch(r"[A-Za-z0-9._+-]+", desktop):
-                launches.append(f"uwsm-app -- gtk-launch {desktop}.desktop")
-    if launches:
+            desktop = app["desktop"]
+            if ws["launch"] and valid_desktop(desktop) and desktop not in launches:
+                launches.append(desktop)
+    tools = launch_tools() if launches else None
+    if tools:
+        uwsm_app, gtk_launch = tools
         lines += ["", 'hl.on("hyprland.start", function()']
-        lines += [f"  hl.exec_cmd({lua_str(cmd)})" for cmd in launches]
+        lines += [f"  hl.exec_cmd({lua_str(f'{uwsm_app} -- {gtk_launch} {desktop}.desktop')})" for desktop in launches]
         lines += ["end)"]
     return "\n".join(lines) + "\n"
 
@@ -180,75 +459,150 @@ def generate(data):
 # ------------------------------------------------------------------ commands
 
 def cmd_open(_args):
-    return subprocess.run(["omarchy-shell", "shell", "toggle", PLUGIN_ID, "{}"], check=False).returncode
+    r = safe.run(["omarchy-shell", "shell", "toggle", PLUGIN_ID, "{}"], timeout=10, max_output=64 * 1024)
+    return 0 if r.ok else 1
 
 
-def cmd_write(args):
-    if not args:
-        return fail("write needs JSON", 2)
+def cmd_config(_args):
     try:
-        data = json.loads(args[0])
-    except ValueError:
-        return fail("write: not valid JSON", 2)
-    if not isinstance(data, dict) or not isinstance(data.get("workspaces"), dict):
-        return fail("write: expected {\"workspaces\": {...}}", 2)
-    write_config(data)
-    return cmd_apply([])
-
-
-def cmd_apply(_args):
-    data = load_config()
-    if not workspaces(data):
-        return cmd_remove([], quiet=True)
-    GENERATED.parent.mkdir(parents=True, exist_ok=True)
-    tmp = GENERATED.with_suffix(".lua.tmp")
-    tmp.write_text(generate(data), encoding="utf-8")
-    tmp.replace(GENERATED)
-    subprocess.run(["hyprctl", "reload"], capture_output=True, check=False)
-    errors = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True, check=False).stdout.strip()
-    related = [line for line in errors.splitlines() if "tile" in line.lower() or "blueprint" in line.lower()]
-    if related:
-        notify("Tile blueprints could not be applied", "\n".join(related[:3]))
-        return fail("Hyprland reported: " + " | ".join(related))
-    moved = arrange(data)
-    count = len(workspaces(data))
-    notify("Tile blueprints applied",
-           f"{count} workspace{'s' if count != 1 else ''}" + (f", moved {moved} window{'s' if moved != 1 else ''}" if moved else ""))
-    print(f"Applied {count} blueprint(s); moved {moved} window(s).")
+        doc, problems = load_config()
+    except Unreadable as e:
+        doc, problems = empty_document(), [str(e)]
+    doc["problems"] = problems
+    print(json.dumps(doc, ensure_ascii=False, allow_nan=False))
     return 0
 
 
-def arrange(data):
+def stdin_fd():
+    return sys.stdin.fileno()
+
+
+def read_document(fd, max_bytes=STDIN_MAX, timeout=STDIN_TIMEOUT):
+    """The document on fd: up to the first newline (the editor's Process.write() cannot
+    close its end of the pipe) or EOF, whichever comes first -- capped and deadline-bound."""
+    deadline = time.monotonic() + timeout
+    buf = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            raise TimeoutError("no document arrived on stdin")
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        end = chunk.find(b"\n")
+        buf += chunk if end < 0 else chunk[:end]
+        if len(buf) > max_bytes:
+            raise safe.TooLarge(f"document exceeds {max_bytes // 1024} KB")
+        if end >= 0:
+            break
+    return bytes(buf)
+
+
+def spawn_apply():
+    """Apply in a detached helper under a hard deadline, so a save survives the editor
+    closing (and unloading its processes) right after it."""
+    try:
+        safe.spawn([safe.tool("python3"), str(SELF), "apply"], timeout=APPLY_DEADLINE)
+    except (safe.UnsafeError, OSError) as e:
+        return fail(f"saved, but could not start applying: {e}")
+    print("Saved; applying in the background.")
+    return 0
+
+
+def cmd_write(args):
+    if args not in ([], ["--background"]):
+        return fail("write reads the blueprint document from stdin (one line of JSON), not from arguments", 2)
+    try:
+        raw = read_document(stdin_fd())
+    except (safe.TooLarge, TimeoutError, OSError) as e:
+        return fail(f"write: {e}", 2)
+    try:
+        data = safe.loads(raw, **JSON_LIMITS)
+    except safe.TooLarge as e:
+        return fail(f"write: {e}", 2)
+    except (ValueError, UnicodeDecodeError):
+        return fail("write: expected one line of JSON (for a file: jq -c . FILE | tile-blueprints write)", 2)
+    try:
+        doc, _ = normalize_document(data, strict=True)
+        blob = serialize_config(doc)
+    except Invalid as e:
+        return fail(f"write: {e}", 2)
+    safe.write_file(CONFIG, blob, mode=0o600)
+    return spawn_apply() if args else cmd_apply([])
+
+
+def cmd_apply(_args):
+    try:
+        doc, problems = load_config()
+    except Unreadable as e:
+        notify("Tile blueprints were not applied", str(e))
+        return fail(f"{e}; the generated layout file was left as it was")
+    if not doc["workspaces"]:
+        return cmd_remove([], quiet=True)
+    safe.write_file(GENERATED, generate(doc), mode=0o644)
+    reload_hyprland()
+    related = config_errors()
+    if related:
+        notify("Tile blueprints could not be applied", "\n".join(related))
+        return fail("Hyprland reported: " + " | ".join(related))
+    moved = arrange(doc)
+    count = len(doc["workspaces"])
+    body = f"{count} workspace{'s' if count != 1 else ''}" + (f", moved {moved} window{'s' if moved != 1 else ''}" if moved else "")
+    if problems:
+        body += f"\nSkipped {problems[0]}"
+    notify("Tile blueprints applied", body)
+    print(f"Applied {count} blueprint(s); moved {moved} window(s).")
+    for problem in problems:
+        print(f"skipped {problem}", file=sys.stderr)
+    return 0
+
+
+def move_expression(target, address):
+    """The dispatch for one move, built only from a checked workspace id and address."""
+    if not WORKSPACE_KEY.fullmatch(target) or not ADDRESS.fullmatch(address):
+        raise safe.UnsafeError("refusing to build a dispatch from an unchecked workspace or address")
+    return f'hl.dsp.window.move({{ workspace = "{target}", follow = false, window = "address:{address}" }})'
+
+
+def arrange(doc, budget=ARRANGE_BUDGET):
     pinned = {}
-    for key, ws in workspaces(data):
-        if not ws.get("pin", True):
-            continue
-        for app in apps_of(ws["root"]):
-            pinned.setdefault(str(app["class"]).lower(), key)
+    for key, ws in workspaces(doc):
+        if ws["pin"] and WORKSPACE_KEY.fullmatch(key):
+            for app in apps_of(ws["root"]):
+                pinned.setdefault(app["class"].lower(), key)
+    deadline = time.monotonic() + budget
     moved = 0
-    for client in hypr_json("clients"):
-        target = pinned.get(str(client.get("class", "")).lower())
-        ws = client.get("workspace") or {}
-        if not target or str(ws.get("id")) == target or client.get("floating") or ws.get("id", 0) < 0:
+    for client in clients():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.1:
+            break
+        cls, address = client.get("class"), client.get("address")
+        target = pinned.get(cls.lower()) if valid_class(cls) else None
+        ws = client.get("workspace") if isinstance(client.get("workspace"), dict) else {}
+        wsid = ws.get("id")
+        if not target or type(wsid) is not int or wsid < 0 or str(wsid) == target or client.get("floating"):
             continue
-        expr = (f'hl.dsp.window.move({{ workspace = "{target}", follow = false, '
-                f'window = "address:{client.get("address")}" }})')
-        if subprocess.run(["hyprctl", "dispatch", expr], capture_output=True, check=False).returncode == 0:
+        if not isinstance(address, str) or not ADDRESS.fullmatch(address):
+            continue
+        r = hyprctl(["dispatch", move_expression(target, address)], timeout=min(3.0, remaining), max_output=64 * 1024)
+        if r is not None and r.ok:
             moved += 1
     return moved
 
 
 def cmd_arrange(_args):
-    moved = arrange(load_config())
-    print(f"Moved {moved} window(s).")
+    try:
+        doc, _ = load_config()
+    except Unreadable as e:
+        return fail(str(e))
+    print(f"Moved {arrange(doc)} window(s).")
     return 0
 
 
 def cmd_remove(_args, quiet=False):
-    existed = GENERATED.exists()
-    GENERATED.unlink(missing_ok=True)
+    existed = safe.remove_file(GENERATED)
     if existed:
-        subprocess.run(["hyprctl", "reload"], capture_output=True, check=False)
+        reload_hyprland()
     if not quiet:
         print("Removed the generated layout file." if existed else "Nothing to remove.")
     return 0
@@ -256,105 +610,267 @@ def cmd_remove(_args, quiet=False):
 
 # ------------------------------------------------------------------ discovery
 
+def _check_root_dirs(path, checked):
+    """Every directory above path is root-owned and not group/other-writable."""
+    directory = os.path.dirname(path)
+    while directory not in checked:
+        st = os.stat(directory)
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            raise safe.UnsafeError(f"{directory}: not a root-owned, non-writable directory")
+        checked.add(directory)
+        directory = os.path.dirname(directory)
+
+
+def read_system_data(path, max_bytes, checked=None):
+    """Bytes of a root-owned, non-writable regular file whose real location is system
+    package data (SYSTEM_DATA_ROOTS), at most max_bytes. Links are resolved first and the
+    target must stay inside those roots, in root-owned directories."""
+    real = os.path.realpath(path)
+    if not real.startswith(SYSTEM_DATA_ROOTS):
+        raise safe.UnsafeError(f"{path}: resolves outside system data ({real})")
+    _check_root_dirs(real, checked if checked is not None else set())
+    fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise safe.UnsafeError(f"{path}: not a root-owned, non-writable regular file")
+        if st.st_size > max_bytes:
+            raise safe.TooLarge(f"{path}: {st.st_size} bytes exceeds {max_bytes}")
+        chunks, want = [], max_bytes + 1
+        while want > 0:
+            chunk = os.read(fd, min(65536, want))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            want -= len(chunk)
+        blob = b"".join(chunks)
+        if len(blob) > max_bytes:
+            raise safe.TooLarge(f"{path}: exceeds {max_bytes} bytes")
+        return blob
+    finally:
+        os.close(fd)
+
+
+def _list_entries(directory, system, checked):
+    """[(name, lstat)] of a applications folder, capped."""
+    if not system:
+        return safe.list_dir(directory, max_entries=DIR_SCAN_MAX)
+    real = os.path.realpath(directory)
+    if not (real + "/").startswith(SYSTEM_DATA_ROOTS):
+        raise safe.UnsafeError(f"{directory}: resolves outside system data")
+    _check_root_dirs(real + "/.", checked)
+    out = []
+    with os.scandir(real) as it:
+        for entry in it:
+            if len(out) >= DIR_SCAN_MAX:
+                break
+            out.append((entry.name, entry.stat(follow_symlinks=False)))
+    return sorted(out)
+
+
+def _read_entry(path, lst, system, checked):
+    if system:
+        return read_system_data(path, DESKTOP_FILE_MAX, checked)
+    if stat.S_ISREG(lst.st_mode):
+        return safe.read_file(path, DESKTOP_FILE_MAX)
+    if stat.S_ISLNK(lst.st_mode):
+        # User flatpak exports are links into ~/.local/share/flatpak. Follow one only to a
+        # file plugin_safety then reads without following anything (ours, under $HOME), or
+        # into system package data through the root-owned reader.
+        real = os.path.realpath(path)
+        if real.startswith(str(HOME) + "/"):
+            return safe.read_file(real, DESKTOP_FILE_MAX)
+        return read_system_data(path, DESKTOP_FILE_MAX, checked)
+    return None
+
+
+def clean_icon(value):
+    """A themed icon name, or an absolute path to a regular image file of bounded size that
+    is ours under $HOME or root's in a system location. Anything else: "" (generic icon)."""
+    if not isinstance(value, str) or not value or len(value) > 1024 or CONTROL.search(value):
+        return ""
+    if not value.startswith("/"):
+        return value if ICON_NAME.fullmatch(value) else ""
+    if os.path.normpath(value) != value or not value.lower().endswith(ICON_EXTENSIONS):
+        return ""
+    try:
+        real = os.path.realpath(value)
+        st = os.stat(real)
+    except (OSError, ValueError):
+        return ""
+    if (not stat.S_ISREG(st.st_mode) or st.st_size > ICON_FILE_MAX or st.st_mode & 0o022
+            or not real.lower().endswith(ICON_EXTENSIONS)):
+        return ""
+    mine = st.st_uid == os.getuid() and real.startswith(str(HOME) + "/")
+    system = st.st_uid == 0 and real.startswith(SYSTEM_ICON_ROOTS)
+    return real if mine or system else ""
+
+
+def parse_desktop_entry(blob, stem):
+    """The entry as {stem, desktop, name, icon, wmclass}; False when hidden from menus; None
+    when it is not a desktop entry at all. desktop is the id login launches use, and is ""
+    when the file name is not a safe gtk-launch argument (web apps and games often have
+    spaces): such an app can still be placed in a tile, it just is not launched at login."""
+    try:
+        parser = configparser.ConfigParser(interpolation=None, strict=False, delimiters=("=",))
+        parser.read_string(blob.decode("utf-8"))
+        entry = parser["Desktop Entry"]
+        kind = entry.get("Type", "Application")
+        hidden = entry.get("NoDisplay", "false").lower() == "true" or entry.get("Hidden", "false").lower() == "true"
+        name, icon, wmclass = entry.get("Name", ""), entry.get("Icon", ""), entry.get("StartupWMClass", "")
+    except (UnicodeDecodeError, configparser.Error, KeyError, ValueError):
+        return None
+    if kind != "Application" or hidden:
+        return False
+    return {"stem": stem, "desktop": stem if valid_desktop(stem) else "", "name": clean_text(name) or stem,
+            "icon": clean_icon(icon), "wmclass": wmclass if valid_class(wmclass) else ""}
+
+
 def desktop_entries():
     """Installed apps keyed by desktop id, first directory wins (user over system)."""
-    entries = {}
-    for directory in APP_DIRS:
-        if not directory.is_dir():
+    entries, seen, checked = {}, set(), set()
+    folders = [(d, False) for d in USER_APP_DIRS] + [(d, True) for d in SYSTEM_APP_DIRS]
+    for directory, system in folders:
+        try:
+            listing = _list_entries(directory, system, checked)
+        except (safe.UnsafeError, OSError):
             continue
-        for path in sorted(directory.glob("*.desktop")):
-            desktop_id = path.stem
-            if desktop_id in entries:
+        for name, lst in listing:
+            if len(entries) >= MAX_DESKTOP_ENTRIES:
+                return entries
+            stem = name[:-len(".desktop")] if name.endswith(".desktop") else ""
+            if stem in seen or not valid_class(stem):
                 continue
-            parser = configparser.ConfigParser(interpolation=None, strict=False)
             try:
-                parser.read(path, encoding="utf-8")
-                entry = parser["Desktop Entry"]
-            except Exception:
+                blob = _read_entry(os.path.join(directory, name), lst, system, checked)
+            except (safe.UnsafeError, OSError):
                 continue
-            if entry.get("Type", "Application") != "Application" or entry.get("NoDisplay", "false").lower() == "true":
+            entry = parse_desktop_entry(blob, stem) if blob else None
+            if entry is None:
                 continue
-            if entry.get("Hidden", "false").lower() == "true":
-                continue
-            entries[desktop_id] = {
-                "desktop": desktop_id,
-                "name": entry.get("Name", desktop_id),
-                "icon": entry.get("Icon", ""),
-                "wmclass": entry.get("StartupWMClass", ""),
-            }
+            seen.add(stem)
+            if entry:
+                entries[stem] = entry
     return entries
 
 
 def class_index(entries):
     index = {}
     for e in entries.values():
-        for key in (e["wmclass"], e["desktop"], e["desktop"].split(".")[-1] if "." in e["desktop"] else ""):
+        for key in (e["wmclass"], e["stem"], e["stem"].split(".")[-1] if "." in e["stem"] else ""):
             if key:
                 index.setdefault(key.lower(), e)
     return index
+
+
+def print_bounded(items, max_items, max_bytes=None):
+    """A JSON array of at most max_items items and max_bytes (default OUTPUT_MAX) bytes."""
+    max_bytes = OUTPUT_MAX if max_bytes is None else max_bytes
+    parts, size = [], 3
+    for item in items[:max_items]:
+        encoded = json.dumps(item, ensure_ascii=False, allow_nan=False)
+        size += len(encoded.encode("utf-8")) + 1
+        if size > max_bytes:
+            break
+        parts.append(encoded)
+    sys.stdout.write("[" + ",".join(parts) + "]\n")
 
 
 def cmd_apps(_args):
     entries = desktop_entries()
     index = class_index(entries)
     out, seen = [], set()
-    for client in hypr_json("clients"):
-        cls = str(client.get("class") or "")
-        if not cls or cls.lower() in seen:
+    for client in clients():
+        cls = client.get("class")
+        if not valid_class(cls) or cls.lower() in seen:
             continue
         seen.add(cls.lower())
         e = index.get(cls.lower())
-        out.append({"class": cls, "name": e["name"] if e else cls, "desktop": e["desktop"] if e else "",
+        out.append({"class": cls, "name": e["name"] if e else clean_text(cls), "desktop": e["desktop"] if e else "",
                     "icon": e["icon"] if e else "", "running": True})
     for e in sorted(entries.values(), key=lambda x: x["name"].lower()):
-        cls = e["wmclass"] or e["desktop"]
+        if len(out) >= MAX_APPS_OUT:
+            break
+        cls = e["wmclass"] or e["stem"]
         if cls.lower() in seen:
             continue
         seen.add(cls.lower())
         out.append({"class": cls, "name": e["name"], "desktop": e["desktop"], "icon": e["icon"], "running": False})
-    print(json.dumps(out, ensure_ascii=False))
+    print_bounded(out, MAX_APPS_OUT)
     return 0
 
 
+def _pair(value):
+    if (isinstance(value, list) and len(value) == 2
+            and all(type(v) is int and abs(v) <= MAX_COORDINATE for v in value)):
+        return value
+    return None
+
+
 def cmd_windows(args):
-    if not args or not args[0].isdigit():
-        return fail("windows needs a workspace number", 2)
+    if len(args) != 1 or not WORKSPACE_KEY.fullmatch(args[0]):
+        return fail(f"windows needs a workspace number (1-{MAX_WORKSPACE_ID})", 2)
     ws = int(args[0])
     index = class_index(desktop_entries())
     out = []
-    for c in hypr_json("clients"):
-        if (c.get("workspace") or {}).get("id") != ws or c.get("floating") or not c.get("mapped", True) or c.get("hidden"):
+    for c in clients():
+        workspace = c.get("workspace") if isinstance(c.get("workspace"), dict) else {}
+        if type(workspace.get("id")) is not int or workspace["id"] != ws:
             continue
-        (x, y), (w, h) = c.get("at", [0, 0]), c.get("size", [0, 0])
-        cls = str(c.get("class") or "")
-        e = index.get(cls.lower())
+        if c.get("floating") or c.get("mapped", True) is False or c.get("hidden"):
+            continue
+        at, size = _pair(c.get("at")), _pair(c.get("size"))
+        if at is None or size is None:
+            continue
+        cls = c.get("class") if valid_class(c.get("class")) else ""
+        e = index.get(cls.lower()) if cls else None
         out.append({"class": cls, "name": e["name"] if e else cls, "desktop": e["desktop"] if e else "",
-                    "x": x, "y": y, "w": w, "h": h})
-    print(json.dumps(out, ensure_ascii=False))
+                    "x": at[0], "y": at[1], "w": size[0], "h": size[1]})
+    print_bounded(out, MAX_WINDOWS)
+    return 0
+
+
+def cmd_active_workspace(_args):
+    data = hypr_json("activeworkspace")
+    wsid = data.get("id") if isinstance(data, dict) else None
+    if type(wsid) is not int or not 1 <= wsid <= MAX_WORKSPACE_ID:
+        print('{"id": null}')
+        return 1
+    print(json.dumps({"id": wsid}))
     return 0
 
 
 def cmd_status(_args):
-    data = load_config()
-    pairs = workspaces(data)
+    try:
+        doc, problems = load_config()
+    except Unreadable as e:
+        return fail(str(e))
+    pairs = workspaces(doc)
     if not pairs:
         print("No blueprints configured.")
     for key, ws in pairs:
-        apps = [a.get("name") or a["class"] for a in apps_of(ws["root"])]
+        apps = [a["name"] for a in apps_of(ws["root"])]
         tiles = sum(1 for _ in leaves(ws["root"]))
         print(f"workspace {key}: {tiles} tile(s), apps: {', '.join(apps) or 'none'}"
-              f"{'' if ws.get('pin', True) else ' · not pinned'}{'' if ws.get('launch', True) else ' · no login launch'}")
-    live = {str(w.get("id")): w.get("tiledLayout") for w in hypr_json("workspaces")}
+              f"{'' if ws['pin'] else ' · not pinned'}{'' if ws['launch'] else ' · no login launch'}")
+    for problem in problems:
+        print(f"skipped {problem}")
+    listed = hypr_json("workspaces")
+    live = {}
+    for w in listed if isinstance(listed, list) else []:
+        if isinstance(w, dict) and type(w.get("id")) is int:
+            live[str(w["id"])] = clean_text(w.get("tiledLayout"), 64)
     for key, _ in pairs:
         if key in live:
             print(f"  workspace {key} is open, layout: {live[key]}")
-    print(f"generated file: {'present' if GENERATED.exists() else 'absent'} ({GENERATED})")
+    print(f"generated file: {'present' if os.path.lexists(GENERATED) else 'absent'} ({GENERATED})")
     return 0
 
 
 COMMANDS = {
-    "open": cmd_open, "write": cmd_write, "apply": cmd_apply, "arrange": cmd_arrange,
-    "windows": cmd_windows, "apps": cmd_apps, "status": cmd_status, "remove": cmd_remove,
+    "open": cmd_open, "config": cmd_config, "write": cmd_write, "apply": cmd_apply, "arrange": cmd_arrange,
+    "windows": cmd_windows, "apps": cmd_apps, "active-workspace": cmd_active_workspace,
+    "status": cmd_status, "remove": cmd_remove,
 }
 
 
@@ -363,7 +879,14 @@ def main(argv):
         print(__doc__.strip())
         return 0 if len(argv) >= 2 else 2
     fn = COMMANDS.get(argv[1])
-    return fn(argv[2:]) if fn else fail(f"unknown command: {argv[1]}", 2)
+    if not fn:
+        return fail(f"unknown command: {clean_text(argv[1], 64)}", 2)
+    try:
+        return fn(argv[2:])
+    except safe.UnsafeError as e:
+        return fail(str(e))
+    except OSError as e:
+        return fail(str(e))
 
 
 if __name__ == "__main__":

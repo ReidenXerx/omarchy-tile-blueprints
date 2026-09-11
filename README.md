@@ -30,7 +30,8 @@ To add its entries to the Omarchy menu as well:
 ~/.config/omarchy/plugins/reidenxerx.tile-blueprints/bin/tile-blueprints-menu-install
 ```
 
-It needs Hyprland 0.56 or newer (Lua config, Lua layouts), plus `python3` and `hyprctl`.
+It needs Hyprland 0.56 or newer (Lua config, Lua layouts), plus `/usr/bin/python3` and
+`/usr/bin/hyprctl`.
 
 ## Use
 
@@ -119,6 +120,28 @@ off*. The installer writes only between its own marker comments in
 `~/.config/omarchy/extensions/omarchy-menu.jsonc` and leaves the rest of that file
 untouched. It is safe to re-run, and it rolls back rather than leaving the file
 unparseable, because a malformed menu file silently disables **every** user entry.
+
+## Security
+
+- **Trusted programs only.** The editor starts its helper as `/usr/bin/python3
+  bin/tile-blueprints`. Everything the helper runs (`hyprctl`, `notify-send`,
+  `omarchy-shell`) is a root-owned binary in `/usr/bin`, with a deadline, an output ceiling
+  and `PATH=/usr/bin`; the login launches in the generated file name
+  `/usr/bin/uwsm-app` and `/usr/bin/gtk-launch` by absolute path. The editor stops any
+  helper that overruns (SIGTERM, then SIGKILL).
+- **No payloads in argv.** Saving hands the blueprint document to the helper on stdin.
+- **Files.** Reads and writes go through the vendored `bin/plugin_safety.py`: no symlinks
+  followed, owner and type checks, size caps, random temporary files replaced atomically.
+  System desktop entries are read only when they are root-owned regular files that really
+  live under `/usr/share`, `/usr/local/share`, `/usr/lib` or `/var/lib/flatpak` (64 KB
+  each, at most 3000 apps).
+- **The blueprint file is untrusted input.** It is capped at 512 KB and normalized before
+  any Lua is generated: workspaces 1–99 (at most 10), 64 tiles and 16 split levels per
+  workspace, 32 apps per tile, class names up to 256 characters without control
+  characters, desktop ids of `[A-Za-z0-9._+-]`, finite positive sizes. Strings enter the
+  Lua file only as escaped literals (printable ASCII, every other byte as `\ddd`) and class
+  regexes are escaped, so a hostile window class cannot break out of its string. Window
+  addresses and workspace ids are checked before anything is dispatched.
 
 ## Remove
 
