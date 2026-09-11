@@ -281,6 +281,54 @@ Item {
     })
   }
 
+  // Icons and running state come from the app list; blueprints store only class, name and
+  // desktop id, so a renamed icon theme never goes stale inside the saved file.
+  readonly property var appIndex: {
+    var map = {}
+    for (var i = 0; i < apps.length; i++) {
+      var a = apps[i]
+      if (a.desktop) map["d:" + String(a.desktop).toLowerCase()] = a
+      if (a["class"]) map["c:" + String(a["class"]).toLowerCase()] = a
+    }
+    return map
+  }
+
+  function appInfo(app) {
+    if (!app) return null
+    return root.appIndex["d:" + String(app.desktop || "").toLowerCase()]
+      || root.appIndex["c:" + String(app["class"] || "").toLowerCase()] || null
+  }
+
+  function iconFor(app) {
+    var info = root.appInfo(app)
+    var icon = String((info && info.icon) || (app && app.icon) || "")
+    var library = root.shell && root.shell.appLibrary
+    if (library && typeof library.iconSource === "function") return library.iconSource(icon)
+    if (icon.indexOf("file://") === 0 || icon.indexOf("image://") === 0) return icon
+    if (icon.charAt(0) === "/") return "file://" + icon
+    var themed = icon ? Quickshell.iconPath(icon, true) : ""
+    return themed || Quickshell.iconPath("application-x-executable", true)
+  }
+
+  function isRunning(app) {
+    var info = root.appInfo(app)
+    return !!(info && info.running)
+  }
+
+  // How the layout shares one tile between its apps: evenly, along the longer side.
+  function cardBoxes(w, h, count) {
+    var out = []
+    if (count <= 0 || w <= 0 || h <= 0) return out
+    var gap = Style.space(6)
+    var across = w >= h
+    var size = ((across ? w : h) - gap * (count - 1)) / count
+    for (var i = 0; i < count; i++) {
+      var offset = i * (size + gap)
+      out.push(across ? { x: offset, y: 0, w: size, h: h } : { x: 0, y: offset, w: w, h: size })
+    }
+    return out
+  }
+
   function workspaceHasBlueprint(n) {
     return Model.isMeaningful(root.draft.workspaces[String(n)])
   }
@@ -481,84 +529,192 @@ Item {
                     onDoubleClicked: { root.selected = tile.modelData.id; root.openPicker() }
                   }
 
-                  Text {
-                    anchors.top: parent.top
-                    anchors.right: parent.right
-                    anchors.margins: Style.spacing.md
-                    textFormat: Text.PlainText
-                    text: root.percent(tile.modelData.w, canvas.width) + " × " + root.percent(tile.modelData.h, canvas.height)
-                    color: root.foreground
-                    opacity: 0.45
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    visible: tile.width > Style.space(90)
-                  }
-
-                  Column {
-                    anchors.centerIn: parent
-                    width: parent.width - Style.spacing.lg * 2
-                    spacing: Style.spacing.sm
+                  // A preview of what Hyprland will do with this tile: one window per app,
+                  // sharing the tile evenly along its longer side.
+                  Item {
+                    id: cards
+                    anchors.fill: parent
+                    anchors.margins: Style.spacing.lg
+                    anchors.bottomMargin: Style.spacing.sm + tileFoot.height + Style.spacing.sm
+                    visible: tile.modelData.apps.length > 0
 
                     Repeater {
                       model: tile.modelData.apps
 
                       delegate: Rectangle {
-                        id: chip
+                        id: card
                         required property var modelData
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        width: Math.min(parent.width, chipText.implicitWidth + chipX.width + Style.spacing.lg * 2)
-                        height: Style.space(26)
-                        radius: height / 2
-                        color: Util.alpha(root.accent, 0.18)
+                        required property int index
+                        readonly property var box: root.cardBoxes(cards.width, cards.height, tile.modelData.apps.length)[index]
+                        readonly property int iconSide: Math.max(Style.space(20), Math.min(Style.space(64), Math.min(width, height) * 0.34))
 
-                        Text {
-                          id: chipText
-                          anchors.left: parent.left
-                          anchors.leftMargin: Style.spacing.lg
-                          anchors.right: chipX.left
-                          anchors.verticalCenter: parent.verticalCenter
-                          textFormat: Text.PlainText
-                          text: chip.modelData.name || chip.modelData["class"]
-                          color: root.foreground
-                          elide: Text.ElideRight
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.body
-                        }
+                        x: box ? box.x : 0
+                        y: box ? box.y : 0
+                        width: box ? box.w : 0
+                        height: box ? box.h : 0
+                        radius: root.cornerRadius
+                        color: Util.alpha(root.foreground, tile.isSelected ? 0.10 : 0.06)
+                        border.width: Math.max(1, Style.space(1))
+                        border.color: Util.alpha(root.foreground, cardHover.hovered ? 0.35 : 0.14)
 
-                        Text {
-                          id: chipX
-                          anchors.right: parent.right
-                          anchors.rightMargin: Style.spacing.md
-                          anchors.verticalCenter: parent.verticalCenter
-                          textFormat: Text.PlainText
-                          text: "×"
-                          color: root.foreground
-                          opacity: 0.6
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.title
+                        HoverHandler { id: cardHover }
 
-                          MouseArea {
-                            anchors.fill: parent
-                            anchors.margins: -Style.space(4)
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: root.removeApp(tile.modelData.id, chip.modelData["class"])
+                        Column {
+                          anchors.centerIn: parent
+                          width: parent.width - Style.spacing.lg * 2
+                          spacing: Style.spacing.sm
+
+                          Image {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            width: card.iconSide
+                            height: card.iconSide
+                            sourceSize.width: card.iconSide * 2
+                            sourceSize.height: card.iconSide * 2
+                            source: root.iconFor(card.modelData)
+                            fillMode: Image.PreserveAspectFit
+                            asynchronous: true
+                            smooth: true
+                          }
+
+                          Text {
+                            width: parent.width
+                            visible: card.height >= Style.space(76)
+                            horizontalAlignment: Text.AlignHCenter
+                            textFormat: Text.PlainText
+                            text: card.modelData.name || card.modelData["class"]
+                            elide: Text.ElideRight
+                            color: root.foreground
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.body
+                          }
+
+                          Text {
+                            width: parent.width
+                            visible: card.height >= Style.space(110) && card.width >= Style.space(110)
+                            horizontalAlignment: Text.AlignHCenter
+                            textFormat: Text.PlainText
+                            text: card.modelData["class"]
+                            elide: Text.ElideMiddle
+                            color: root.foreground
+                            opacity: 0.4
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
                           }
                         }
+
+                        Rectangle {
+                          visible: root.isRunning(card.modelData)
+                          anchors.left: parent.left
+                          anchors.top: parent.top
+                          anchors.margins: Style.spacing.md
+                          width: Style.space(6); height: width; radius: width / 2
+                          color: root.accent
+                        }
+
+                        Rectangle {
+                          id: removeButton
+                          visible: cardHover.hovered || tile.isSelected
+                          anchors.right: parent.right
+                          anchors.top: parent.top
+                          anchors.margins: Style.spacing.sm
+                          width: Style.space(22); height: width; radius: width / 2
+                          color: removeArea.containsMouse ? Util.alpha(root.accent, 0.3) : "transparent"
+
+                          Text {
+                            anchors.centerIn: parent
+                            textFormat: Text.PlainText
+                            text: "×"
+                            color: root.foreground
+                            opacity: removeArea.containsMouse ? 1 : 0.6
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.title
+                          }
+
+                          MouseArea {
+                            id: removeArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.removeApp(tile.modelData.id, card.modelData["class"])
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  // Empty tile: a target to click.
+                  Column {
+                    anchors.centerIn: parent
+                    visible: tile.modelData.apps.length === 0
+                    spacing: Style.spacing.md
+
+                    Rectangle {
+                      anchors.horizontalCenter: parent.horizontalCenter
+                      width: Style.space(44); height: width; radius: width / 2
+                      color: plusArea.containsMouse ? Util.alpha(root.accent, 0.22) : Util.alpha(root.foreground, 0.07)
+                      border.width: Math.max(1, Style.space(1))
+                      border.color: tile.isSelected || plusArea.containsMouse ? root.accent : Util.alpha(root.foreground, 0.2)
+
+                      Text {
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: "+"
+                        color: tile.isSelected ? root.accent : root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.display
+                      }
+
+                      MouseArea {
+                        id: plusArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: { root.selected = tile.modelData.id; root.openPicker() }
                       }
                     }
 
                     Text {
                       anchors.horizontalCenter: parent.horizontalCenter
-                      width: parent.width
-                      horizontalAlignment: Text.AlignHCenter
-                      wrapMode: Text.WordWrap
+                      visible: tile.height >= Style.space(110)
                       textFormat: Text.PlainText
-                      text: tile.modelData.apps.length === 0
-                        ? (tile.isSelected ? "Empty · A to add an app" : "Empty")
-                        : (tile.isSelected ? "A to add another" : "")
-                      visible: text !== ""
+                      text: "Add app"
                       color: root.foreground
-                      opacity: 0.5
+                      opacity: 0.55
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  Item {
+                    id: tileFoot
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.leftMargin: Style.spacing.lg
+                    anchors.rightMargin: Style.spacing.lg
+                    anchors.bottomMargin: Style.spacing.sm
+                    height: Style.space(16)
+
+                    Text {
+                      anchors.left: parent.left
+                      anchors.verticalCenter: parent.verticalCenter
+                      visible: tile.isSelected && tile.modelData.apps.length > 0 && tile.width >= Style.space(220)
+                      textFormat: Text.PlainText
+                      text: "A  add another app"
+                      color: root.accent
+                      opacity: 0.75
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Text {
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      visible: tile.width >= Style.space(90)
+                      textFormat: Text.PlainText
+                      text: root.percent(tile.modelData.w, canvas.width) + " × " + root.percent(tile.modelData.h, canvas.height)
+                      color: root.foreground
+                      opacity: 0.45
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
                     }
@@ -686,10 +842,25 @@ Item {
                   radius: root.cornerRadius
                   color: index === root.pickerIndex ? root.selectedBackground : "transparent"
 
-                  Column {
+                  Image {
+                    id: appIcon
                     anchors.left: parent.left
-                    anchors.right: runningDot.left
                     anchors.leftMargin: Style.spacing.lg
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(24)
+                    height: width
+                    sourceSize.width: width * 2
+                    sourceSize.height: height * 2
+                    source: root.iconFor(appRow.modelData)
+                    fillMode: Image.PreserveAspectFit
+                    asynchronous: true
+                    smooth: true
+                  }
+
+                  Column {
+                    anchors.left: appIcon.right
+                    anchors.right: runningDot.left
+                    anchors.leftMargin: Style.spacing.md
                     anchors.rightMargin: Style.spacing.md
                     anchors.verticalCenter: parent.verticalCenter
 
