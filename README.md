@@ -6,8 +6,9 @@ An [Omarchy](https://omarchy.org) editor for **per-workspace tiling layouts**. D
 for a workspace, say which app lives in each one, and from then on those apps open
 straight into their tile at the proportions you set.
 
-A workspace you have already arranged by hand becomes a blueprint in one key: **capture**
-reads the real window sizes and turns them into tiles.
+Drag apps between tiles to rearrange them. A workspace you have already arranged by hand
+becomes a blueprint in one key: **capture** reads the real window sizes and turns them into
+tiles, and **snapshot** does the same straight from the workspace and saves it at once.
 
 ![overlay](https://img.shields.io/badge/omarchy-overlay-blue)
 
@@ -22,6 +23,12 @@ a stock install, next to `SUPER + L` (layout toggle):
 
 ```lua
 o.bind("SUPER + ALT + L", "Tile blueprints", "omarchy-shell shell toggle reidenxerx.tile-blueprints '{}'")
+```
+
+And one to [snapshot](#snapshot-a-workspace) the workspace you are on:
+
+```lua
+o.bind("SUPER + ALT + SHIFT + L", "Snapshot workspace", "~/.config/omarchy/plugins/reidenxerx.tile-blueprints/bin/tile-blueprints snapshot")
 ```
 
 To add its entries to the Omarchy menu as well:
@@ -44,6 +51,8 @@ The editor opens on the workspace you are on, drawn in your screen's proportions
 | `X` / `Del` | remove the tile; its neighbours take the space |
 | `Shift` + arrows | make the tile wider, narrower, taller, shorter |
 | drag a divider | set the split with the mouse |
+| drag an app | onto another app: swap the two; anywhere else on a tile: move it there (`Shift`: share the other app's tile) |
+| drag from the app list | put that app in the tile you drop it on |
 | arrows / `hjkl`, `Tab` | select a tile |
 | `A` / `Enter` / double-click | add an app to the tile (running apps first) |
 | `Backspace`, or an app's `×` | take the last app out, or that one |
@@ -53,10 +62,26 @@ The editor opens on the workspace you are on, drawn in your screen's proportions
 | `1`–`9`, `0` | edit another workspace |
 | `Ctrl` + `S` | save and apply |
 | `Ctrl` + `Del` | clear this workspace's blueprint |
-| `Esc` | close (twice if there are unsaved changes) |
+| `Esc` | close; with unsaved changes it asks whether to save first |
 
 Saving applies at once: Hyprland reloads, and running apps that belong elsewhere move to
-their workspace.
+their workspace. The editor also asks before anything else closes it with changes still unsaved: a click
+outside, or its key pressed again.
+
+## Snapshot a workspace
+
+Arrange a workspace by hand, then save it as its blueprint without opening the editor:
+
+```bash
+tile-blueprints snapshot      # the workspace you are on
+tile-blueprints snapshot 3    # or a given one
+```
+
+or pick *Snapshot this workspace* in the Omarchy menu, or press the key from [Install](#install).
+It reads the tiled windows the way capture does, saves and applies them, and says what it
+saved in a notification. A workspace that already had a blueprint keeps its **pin** and
+**open at login** settings. A new one records the layout only, so no app starts opening there
+or at login until you turn that on in the editor.
 
 ## How windows are placed
 
@@ -91,7 +116,7 @@ edited**. The generated file:
   proportions. Change them in the editor, or arrange by hand and capture again.
 - **`SUPER + L` still works.** It switches the current workspace to dwindle or scrolling
   until the next reload, then the blueprint takes over again.
-- **Capture sees tiled windows only.** Floating windows are left out, and windows that
+- **Capture and snapshot see tiled windows only.** Floating windows are left out, and windows that
   overlap in ways a tiling layout cannot produce share a tile.
 
 ## From the command line
@@ -101,6 +126,7 @@ tile-blueprints status     # what is configured, and what Hyprland is using
 tile-blueprints apply      # regenerate, reload, arrange
 tile-blueprints arrange    # just move running apps to their workspaces
 tile-blueprints windows 2  # windows on workspace 2 as JSON (what capture reads)
+tile-blueprints snapshot   # save the windows on this workspace as its blueprint
 tile-blueprints remove     # turn blueprints off (keeps your saved blueprints)
 ```
 
@@ -115,8 +141,8 @@ bin/tile-blueprints-menu-install remove   # take them out
 bin/tile-blueprints-menu-install print    # just show the snippet
 ```
 
-This adds *Edit blueprints*, *Arrange apps now*, *Show blueprints* and *Turn blueprints
-off*. The installer writes only between its own marker comments in
+This adds *Edit blueprints*, *Snapshot this workspace*, *Arrange apps now*, *Show
+blueprints* and *Turn blueprints off*. The installer writes only between its own marker comments in
 `~/.config/omarchy/extensions/omarchy-menu.jsonc` and leaves the rest of that file
 untouched. It is safe to re-run, and it rolls back rather than leaving the file
 unparseable, because a malformed menu file silently disables **every** user entry.
@@ -152,8 +178,12 @@ omarchy plugin remove reidenxerx.tile-blueprints
 rm -f ~/.config/omarchy/tile-blueprints.json
 ```
 
-Also remove the key binding if you added one. Nothing else is left behind: the plugin runs
+Also remove the key bindings if you added them. Nothing else is left behind: the plugin runs
 no daemon.
+
+## Support
+
+If Tile blueprints is useful to you, you can support its development on [Donatello](https://donatello.to/DuduPhudu).
 
 ## License
 

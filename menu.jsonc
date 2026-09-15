@@ -1,12 +1,17 @@
   "setup.tile-blueprints": {
     "icon": "󰕴",
     "label": "Tile blueprints",
-    "aliases": ["tiling", "tiles", "layout", "blueprint", "workspace layout", "arrange"]
+    "aliases": ["tiling", "tiles", "layout", "blueprint", "workspace layout", "arrange", "snapshot"]
   },
   "setup.tile-blueprints.open": {
     "icon": "󰕴",
     "label": "Edit blueprints",
     "action": "omarchy-shell shell toggle reidenxerx.tile-blueprints '{}'"
+  },
+  "setup.tile-blueprints.snapshot": {
+    "icon": "󰄀",
+    "label": "Snapshot this workspace",
+    "action": "@PLUGIN_BIN@/tile-blueprints snapshot"
   },
   "setup.tile-blueprints.arrange": {
     "icon": "󰁨",

@@ -9,6 +9,8 @@
   tile-blueprints apply                regenerate the Hyprland layout file, reload, arrange
   tile-blueprints arrange              move running apps to the workspaces they are pinned to
   tile-blueprints windows <ws>         tiled windows on a workspace, as JSON (for capture)
+  tile-blueprints snapshot [<ws>]      save the windows on a workspace (default: the focused one)
+                                       as its blueprint, then apply
   tile-blueprints apps                 apps to assign: running windows and installed apps, JSON
   tile-blueprints active-workspace     the focused workspace id, as JSON
   tile-blueprints status               what is configured and whether Hyprland has it
@@ -531,6 +533,15 @@ def cmd_write(args):
     return spawn_apply() if args else cmd_apply([])
 
 
+def apply_document(doc):
+    """Write the generated layout file for doc, reload Hyprland and move pinned apps home.
+    Returns (Hyprland's errors about the file, windows moved); nothing moves after an error."""
+    safe.write_file(GENERATED, generate(doc), mode=0o644)
+    reload_hyprland()
+    related = config_errors()
+    return (related, 0) if related else ([], arrange(doc))
+
+
 def cmd_apply(_args):
     try:
         doc, problems = load_config()
@@ -539,13 +550,10 @@ def cmd_apply(_args):
         return fail(f"{e}; the generated layout file was left as it was")
     if not doc["workspaces"]:
         return cmd_remove([], quiet=True)
-    safe.write_file(GENERATED, generate(doc), mode=0o644)
-    reload_hyprland()
-    related = config_errors()
+    related, moved = apply_document(doc)
     if related:
         notify("Tile blueprints could not be applied", "\n".join(related))
         return fail("Hyprland reported: " + " | ".join(related))
-    moved = arrange(doc)
     count = len(doc["workspaces"])
     body = f"{count} workspace{'s' if count != 1 else ''}" + (f", moved {moved} window{'s' if moved != 1 else ''}" if moved else "")
     if problems:
@@ -807,10 +815,9 @@ def _pair(value):
     return None
 
 
-def cmd_windows(args):
-    if len(args) != 1 or not WORKSPACE_KEY.fullmatch(args[0]):
-        return fail(f"windows needs a workspace number (1-{MAX_WORKSPACE_ID})", 2)
-    ws = int(args[0])
+def tiled_windows(ws):
+    """The tiled windows on workspace ws with the app each belongs to and its geometry: what
+    capture reads."""
     index = class_index(desktop_entries())
     out = []
     for c in clients():
@@ -826,7 +833,134 @@ def cmd_windows(args):
         e = index.get(cls.lower()) if cls else None
         out.append({"class": cls, "name": e["name"] if e else cls, "desktop": e["desktop"] if e else "",
                     "x": at[0], "y": at[1], "w": size[0], "h": size[1]})
-    print_bounded(out, MAX_WINDOWS)
+    return out
+
+
+def cmd_windows(args):
+    if len(args) != 1 or not WORKSPACE_KEY.fullmatch(args[0]):
+        return fail(f"windows needs a workspace number (1-{MAX_WORKSPACE_ID})", 2)
+    print_bounded(tiled_windows(int(args[0])), MAX_WINDOWS)
+    return 0
+
+
+# ------------------------------------------------------------------ snapshot
+
+# Pixels two neighbouring windows may overlap, or leave between them, and still be cut apart.
+CAPTURE_TOLERANCE = 24
+
+
+def _groups_along(items, axis, tolerance):
+    start, span = ("x", "w") if axis == "h" else ("y", "h")
+    groups, current, reach = [], None, -math.inf
+    for item in sorted(items, key=lambda it: it[start]):
+        if current is not None and item[start] >= reach - tolerance:
+            groups.append(current)
+            current = None
+        if current is None:
+            current = {"items": [], "from": item[start], "to": -math.inf}
+        current["items"].append(item)
+        reach = max(reach, item[start] + item[span])
+        current["to"] = reach
+    if current is not None:
+        groups.append(current)
+    return groups
+
+
+def _cut(items, box, tolerance, counter):
+    if len(items) > 1:
+        for axis in (("h", "v") if box["w"] >= box["h"] else ("v", "h")):
+            groups = _groups_along(items, axis, tolerance)
+            origin, length = (box["x"], box["w"]) if axis == "h" else (box["y"], box["h"])
+            if len(groups) < 2 or length <= 0:
+                continue
+            bounds = [origin] + [(a["to"] + b["from"]) / 2 for a, b in zip(groups, groups[1:])] + [origin + length]
+            sizes, children = [], []
+            for k, group in enumerate(groups):
+                sizes.append(max(0, bounds[k + 1] - bounds[k]) / length)
+                sub = (dict(box, x=bounds[k], w=bounds[k + 1] - bounds[k]) if axis == "h"
+                       else dict(box, y=bounds[k], h=bounds[k + 1] - bounds[k]))
+                children.append(_cut(group["items"], sub, tolerance, counter))
+            weights = [s if s > 0 else 1 / len(sizes) for s in sizes]
+            return {"dir": axis, "sizes": [w / sum(weights) for w in weights], "children": children}
+    counter[0] += 1
+    apps, seen = [], set()
+    for item in items:
+        key = str(item.get("class") or "").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        apps.append({"class": item["class"], "name": item.get("name") or item["class"], "desktop": item.get("desktop") or ""})
+    return {"id": f"t{counter[0]}", "apps": apps}
+
+
+def capture_tree(windows, tolerance=CAPTURE_TOLERANCE):
+    """A blueprint tree from the windows of a hand-arranged workspace, cut into columns and rows
+    wherever a straight line separates them. The same algorithm as capture() in
+    BlueprintModel.js, which the editor runs, over the box the windows span."""
+    items = [w for w in windows if w.get("w", 0) > 0 and w.get("h", 0) > 0]
+    if not items:
+        return {"id": "t1", "apps": []}
+    left, top = min(w["x"] for w in items), min(w["y"] for w in items)
+    right, bottom = max(w["x"] + w["w"] for w in items), max(w["y"] + w["h"] for w in items)
+    return _cut(items, {"x": left, "y": top, "w": right - left, "h": bottom - top}, tolerance, [0])
+
+
+def snapshot_summary(ws, previous):
+    tiles = sum(1 for _ in leaves(ws["root"]))
+    names = [a["name"] for a in apps_of(ws["root"])]
+    where = {(True, True): "Its apps open here and start at login.", (True, False): "Its apps open here.",
+             (False, True): "Its apps start at login.",
+             (False, False): "Layout only: apps still open wherever you start them."}[(ws["pin"], ws["launch"])]
+    return "\n".join([f"{tiles} tile{'s' if tiles != 1 else ''}: {', '.join(names) if names else 'no apps'}",
+                      ("Replaced the blueprint it had. " if previous else "") + where])
+
+
+def cmd_snapshot(args):
+    if len(args) > 1 or (args and not WORKSPACE_KEY.fullmatch(args[0])):
+        return fail(f"snapshot takes an optional workspace number (1-{MAX_WORKSPACE_ID})", 2)
+    if args:
+        key = args[0]
+    else:
+        data = hypr_json("activeworkspace")
+        wsid = data.get("id") if isinstance(data, dict) else None
+        if type(wsid) is not int or not 1 <= wsid <= MAX_WORKSPACE_ID:
+            notify("Nothing was snapshotted", f"Blueprints are for workspaces 1 to {MAX_WORKSPACE_ID}.")
+            return fail(f"the focused workspace is not one of 1-{MAX_WORKSPACE_ID}")
+        key = str(wsid)
+    title = f"Workspace {key} was not saved"
+    windows = tiled_windows(int(key))
+    if not windows:
+        notify(title, "It has no tiled windows to snapshot.")
+        return fail(f"no tiled windows on workspace {key}")
+    try:
+        doc, problems = load_config()
+    except Unreadable as e:
+        notify(title, str(e))
+        return fail(str(e))
+    if problems:
+        # Saving now would drop the part that could not be read.
+        notify(title, f"Part of the saved blueprints could not be read: {problems[0]}")
+        return fail(f"the saved blueprints need fixing first: {problems[0]}")
+    previous = doc["workspaces"].get(key)
+    # A new snapshot records the layout only. Pinning its apps here or starting them at login
+    # changes where they open everywhere, so that stays a choice made in the editor.
+    candidate = dict(doc["workspaces"])
+    candidate[key] = {"root": capture_tree(windows),
+                      "pin": previous["pin"] if previous else False,
+                      "launch": previous["launch"] if previous else False}
+    try:
+        saved, _ = normalize_document({"version": 1, "workspaces": candidate}, strict=True)
+        blob = serialize_config(saved)
+    except Invalid as e:
+        notify(title, str(e))
+        return fail(f"snapshot: {e}")
+    safe.write_file(CONFIG, blob, mode=0o600)
+    related, moved = apply_document(saved)
+    if related:
+        notify(f"Workspace {key} was saved but not applied", "\n".join(related))
+        return fail("Hyprland reported: " + " | ".join(related))
+    notify(f"Workspace {key} saved as a blueprint", snapshot_summary(saved["workspaces"][key], previous))
+    print(f"Saved workspace {key} as a blueprint; moved {moved} window(s).")
     return 0
 
 
@@ -869,7 +1003,7 @@ def cmd_status(_args):
 
 COMMANDS = {
     "open": cmd_open, "config": cmd_config, "write": cmd_write, "apply": cmd_apply, "arrange": cmd_arrange,
-    "windows": cmd_windows, "apps": cmd_apps, "active-workspace": cmd_active_workspace,
+    "windows": cmd_windows, "snapshot": cmd_snapshot, "apps": cmd_apps, "active-workspace": cmd_active_workspace,
     "status": cmd_status, "remove": cmd_remove,
 }
 

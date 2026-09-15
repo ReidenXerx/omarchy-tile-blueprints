@@ -9,7 +9,7 @@ const assert = require("assert")
 const root = path.resolve(__dirname, "..")
 const source = fs.readFileSync(path.join(root, "BlueprintModel.js"), "utf8").replace(/^\.pragma library\s*$/m, "")
 const ctx = {}
-vm.runInNewContext(source + "\nthis.M = { MIN_SIZE, clone, isLeaf, newLeaf, leaves, nextId, pathTo, nodeAt, findLeaf, normalize, split, remove, grow, moveDivider, assign, unassign, order, layout, neighbour, capture, defaultWorkspace, normalizeFile, appCount, isMeaningful, tileLabel }", ctx)
+vm.runInNewContext(source + "\nthis.M = { MIN_SIZE, clone, isLeaf, newLeaf, leaves, nextId, pathTo, nodeAt, findLeaf, normalize, split, remove, grow, moveDivider, assign, unassign, order, layout, neighbour, capture, defaultWorkspace, normalizeFile, appCount, isMeaningful, tileLabel, drop, dropLabel, stableJson, changedWorkspaces, listNumbers }", ctx)
 const M = ctx.M
 
 // vm-context objects carry that context's prototypes; compare plain copies.
@@ -191,6 +191,113 @@ test("isMeaningful ignores an untouched workspace", () => {
 test("tileLabel lists names", () => {
   assert.strictEqual(M.tileLabel({ apps: [app("a", "Alpha"), app("b", "Beta")] }), "Alpha, Beta")
   assert.strictEqual(M.tileLabel({ apps: [] }), "")
+})
+
+// ------------------------------------------------------------------ drag and drop
+
+const reversedKeys = v => Array.isArray(v) ? v.map(reversedKeys)
+  : (v && typeof v === "object" ? Object.fromEntries(Object.keys(v).reverse().map(k => [k, reversedKeys(v[k])])) : v)
+
+function two() {
+  let t = M.split(M.newLeaf("t1"), "t1", "h").root
+  t = M.assign(t, "t1", app("foot", "Foot"))
+  return M.assign(t, "t2", app("dev.warp.Warp", "Warp"))
+}
+const warp = { app: app("dev.warp.Warp", "Warp"), from: "t2" }
+const classesIn = (tree, id) => plain(M.findLeaf(tree, id).apps).map(a => a.class)
+
+test("dropping an app on another app swaps them", () => {
+  const r = M.drop(two(), warp, { tile: "t1", onClass: "FOOT", mode: "swap" })
+  assert.strictEqual(r.kind, "swap")
+  assert.strictEqual(r.other, "Foot")
+  eq(classesIn(r.root, "t1"), ["dev.warp.Warp"])
+  eq(classesIn(r.root, "t2"), ["foot"])
+})
+
+test("swapping inside one tile trades their places", () => {
+  const t = M.assign(M.assign(M.newLeaf("t1"), "t1", app("a")), "t1", app("b"))
+  const r = M.drop(t, { app: app("b"), from: "t1" }, { tile: "t1", onClass: "a", mode: "swap" })
+  assert.strictEqual(r.kind, "swap")
+  eq(classesIn(r.root, "t1"), ["b", "a"])
+})
+
+test("dropping on a tile moves the app out of its old tile", () => {
+  const t = M.split(two(), "t2", "v").root   // t1 | (t2 / t3)
+  const r = M.drop(t, warp, { tile: "t3", onClass: "", mode: "add" })
+  assert.strictEqual(r.kind, "move")
+  eq(classesIn(r.root, "t2"), [])
+  eq(classesIn(r.root, "t3"), ["dev.warp.Warp"])
+})
+
+test("dropping with Shift on an app shares its tile", () => {
+  const r = M.drop(two(), warp, { tile: "t1", onClass: "", mode: "add" })
+  assert.strictEqual(r.kind, "move")
+  eq(classesIn(r.root, "t1"), ["foot", "dev.warp.Warp"])
+  eq(classesIn(r.root, "t2"), [])
+})
+
+test("an app from the list joins a tile and is never swapped", () => {
+  const r = M.drop(two(), { app: app("code", "Code"), from: "" }, { tile: "t1", onClass: "foot", mode: "swap" })
+  assert.strictEqual(r.kind, "add")
+  eq(classesIn(r.root, "t1"), ["foot", "code"])
+})
+
+test("a drop that changes nothing hands back the same tree", () => {
+  const t = two()
+  const cases = [
+    [{ app: app("foot"), from: "t1" }, { tile: "t1", onClass: "", mode: "add" }],
+    [{ app: app("foot"), from: "t1" }, { tile: "t1", onClass: "Foot", mode: "swap" }],
+    [{ app: app("foot"), from: "" }, { tile: "t1", onClass: "", mode: "add" }],
+    [{ app: app("foot"), from: "t1" }, { tile: "t9", onClass: "", mode: "add" }],
+    [{ app: app(""), from: "t1" }, { tile: "t2", onClass: "", mode: "add" }],
+    [{ app: app("foot"), from: "t1" }, null],
+    [null, { tile: "t2", onClass: "", mode: "add" }],
+  ]
+  for (const [drag, target] of cases) {
+    const r = M.drop(t, drag, target)
+    assert.strictEqual(r.kind, "", JSON.stringify([drag, target]))
+    assert.strictEqual(r.root, t)
+  }
+})
+
+test("dropLabel says what letting go would do", () => {
+  const t = two()
+  assert.strictEqual(M.dropLabel(t, warp, null), "Drop Warp on a tile · Esc cancels")
+  assert.strictEqual(M.dropLabel(t, warp, { tile: "t9", onClass: "", mode: "add" }), "Drop Warp on a tile · Esc cancels")
+  assert.ok(M.dropLabel(t, warp, { tile: "t1", onClass: "foot", mode: "swap" }).startsWith("Drop to swap Warp with Foot"))
+  assert.strictEqual(M.dropLabel(t, warp, { tile: "t1", onClass: "", mode: "add" }), "Drop to move Warp to this tile")
+  assert.strictEqual(M.dropLabel(t, { app: app("code", "Code"), from: "" }, { tile: "t2", onClass: "", mode: "add" }), "Drop to put Code in this tile")
+  assert.strictEqual(M.dropLabel(t, warp, { tile: "t2", onClass: "", mode: "add" }), "Warp is already in this tile")
+  assert.strictEqual(M.dropLabel(t, null, null), "")
+})
+
+// ------------------------------------------------------------------ unsaved changes
+
+test("stableJson ignores key order", () => {
+  assert.strictEqual(M.stableJson({ b: [1, { d: 1, c: 2 }], a: null }), M.stableJson({ a: null, b: [1, { c: 2, d: 1 }] }))
+  assert.notStrictEqual(M.stableJson({ a: [1, 2] }), M.stableJson({ a: [2, 1] }))
+})
+
+test("changedWorkspaces lists what saving would change", () => {
+  const ws = root => ({ root, launch: true, pin: true })
+  const saved = { workspaces: { "1": ws(two()), "3": ws(M.assign(M.newLeaf("t1"), "t1", app("code"))) } }
+  eq(M.changedWorkspaces(saved, plain(saved)), [])
+  eq(M.changedWorkspaces(saved, reversedKeys(plain(saved))), [])
+  const draft = plain(saved)
+  draft.workspaces["3"].pin = false
+  draft.workspaces["2"] = plain(M.defaultWorkspace())
+  draft.workspaces["2"].launch = false          // flags on an empty workspace are never saved
+  draft.workspaces["10"] = ws(plain(M.assign(M.newLeaf("t1"), "t1", app("foot"))))
+  eq(M.changedWorkspaces(saved, draft), [3, 10])
+  delete draft.workspaces["1"]
+  eq(M.changedWorkspaces(saved, draft), [1, 3, 10])
+  eq(M.changedWorkspaces({ workspaces: {} }, { workspaces: { "4": M.defaultWorkspace() } }), [])
+})
+
+test("listNumbers reads like a sentence", () => {
+  assert.strictEqual(M.listNumbers([3]), "3")
+  assert.strictEqual(M.listNumbers([1, 3]), "1 and 3")
+  assert.strictEqual(M.listNumbers([1, 2, 10]), "1, 2 and 10")
 })
 
 console.log(`${passed} passed, ${failures.length} failed`)

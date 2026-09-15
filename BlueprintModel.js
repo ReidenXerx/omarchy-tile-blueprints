@@ -220,6 +220,63 @@ function unassign(root, id, cls) {
   return tree
 }
 
+// ------------------------------------------------------------------ drag and drop
+
+function sameClass(a, b) {
+  return String(a || "").toLowerCase() === String(b || "").toLowerCase()
+}
+
+function appIndex(tile, cls) {
+  if (!tile || !tile.apps) return -1
+  for (var i = 0; i < tile.apps.length; i++) if (sameClass(tile.apps[i]["class"], cls)) return i
+  return -1
+}
+
+// What dropping a dragged app does. drag = { app, from }: from is the tile it was dragged out
+// of, or "" for an app dragged in from the app list. target = { tile, onClass, mode }: mode
+// "swap" trades places with the app it was dropped on (only for an app that already has a
+// tile), "add" puts it in the tile and, since an app lives in one tile, out of any other.
+// Returns { root, kind, other }: kind is "swap", "move" or "add", or "" when nothing would
+// change, and then root is the very tree it was given.
+function drop(root, drag, target) {
+  var none = { root: root, kind: "", other: "" }
+  var cls = drag && drag.app ? String(drag.app["class"] || "") : ""
+  if (!cls || !target || !findLeaf(root, target.tile)) return none
+  if (target.mode === "swap" && drag.from && target.onClass && !sameClass(target.onClass, cls)) {
+    var tree = clone(root)
+    var source = findLeaf(tree, drag.from)
+    var dest = findLeaf(tree, target.tile)
+    var i = appIndex(source, cls)
+    var j = appIndex(dest, target.onClass)
+    if (i >= 0 && j >= 0) {
+      var moving = source.apps[i]
+      var other = dest.apps[j]
+      source.apps[i] = other
+      dest.apps[j] = moving
+      return { root: tree, kind: "swap", other: String(other.name || other["class"]) }
+    }
+  }
+  if (appIndex(findLeaf(root, target.tile), cls) >= 0) return none
+  var elsewhere = false
+  var all = leaves(root)
+  for (var k = 0; k < all.length; k++) {
+    if (appIndex(all[k], cls) >= 0) elsewhere = true
+  }
+  return { root: assign(root, target.tile, drag.app), kind: elsewhere ? "move" : "add", other: "" }
+}
+
+// The status line while an app is dragged: what letting go here would do.
+function dropLabel(root, drag, target) {
+  if (!drag || !drag.app) return ""
+  var name = String(drag.app.name || drag.app["class"])
+  if (!target || !findLeaf(root, target.tile)) return "Drop " + name + " on a tile · Esc cancels"
+  var result = drop(root, drag, target)
+  if (result.kind === "swap") return "Drop to swap " + name + " with " + result.other + " · hold Shift to share their tile"
+  if (result.kind === "move") return "Drop to move " + name + " to this tile"
+  if (result.kind === "add") return "Drop to put " + name + " in this tile"
+  return name + " is already in this tile"
+}
+
 // Every tile's id in reading order, for Tab/arrow navigation.
 function order(root) {
   return leaves(root).map(function(l) { return l.id })
@@ -382,4 +439,45 @@ function isMeaningful(ws) {
 function tileLabel(tile) {
   if (!tile || !tile.apps || tile.apps.length === 0) return ""
   return tile.apps.map(function(a) { return a.name || a["class"] }).join(", ")
+}
+
+// ------------------------------------------------------------------ unsaved changes
+
+// JSON with object keys sorted, so two equal trees compare equal whatever order their keys
+// were written in.
+function stableJson(value) {
+  if (value instanceof Array || Array.isArray(value)) {
+    var items = []
+    for (var i = 0; i < value.length; i++) items.push(stableJson(value[i]))
+    return "[" + items.join(",") + "]"
+  }
+  if (value !== null && typeof value === "object") {
+    return "{" + Object.keys(value).sort().map(function(k) { return JSON.stringify(k) + ":" + stableJson(value[k]) }).join(",") + "}"
+  }
+  return JSON.stringify(value === undefined ? null : value)
+}
+
+function savedForm(ws) {
+  return isMeaningful(ws) ? stableJson({ root: ws.root, launch: ws.launch !== false, pin: ws.pin !== false }) : ""
+}
+
+// Workspace numbers, ascending, whose blueprint in draft is not what saved holds. A workspace
+// not worth saving counts as having no blueprint, because saving leaves it out.
+function changedWorkspaces(saved, draft) {
+  var a = (saved && saved.workspaces) || {}
+  var b = (draft && draft.workspaces) || {}
+  var keys = {}
+  for (var k in a) keys[k] = true
+  for (var m in b) keys[m] = true
+  var out = []
+  for (var key in keys) {
+    if (savedForm(a[key]) !== savedForm(b[key])) out.push(Number(key))
+  }
+  return out.sort(function(x, y) { return x - y })
+}
+
+// [3] -> "3", [1, 3] -> "1 and 3", [1, 2, 10] -> "1, 2 and 10"
+function listNumbers(numbers) {
+  if (numbers.length < 2) return numbers.join("")
+  return numbers.slice(0, -1).join(", ") + " and " + numbers[numbers.length - 1]
 }

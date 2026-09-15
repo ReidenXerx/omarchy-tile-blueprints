@@ -722,6 +722,177 @@ class Discovery(Sandbox):
             self.assertEqual((got[0], json.loads(got[1])), (code, printed), value)
 
 
+# ------------------------------------------------------------------ snapshot
+
+NODE_CAPTURE = r"""
+const fs = require("fs")
+const vm = require("vm")
+const [file, casesJson] = process.argv.slice(1)
+const ctx = {}
+vm.runInNewContext(fs.readFileSync(file, "utf8").replace(/^\.pragma library\s*$/m, "") + "\nthis.capture = capture", ctx)
+const out = JSON.parse(casesJson).map(ws => {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
+  for (const w of ws) { x0 = Math.min(x0, w.x); y0 = Math.min(y0, w.y); x1 = Math.max(x1, w.x + w.w); y1 = Math.max(y1, w.y + w.h) }
+  return ctx.capture(ws, ws.length ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : { x: 0, y: 0, w: 0, h: 0 })
+})
+process.stdout.write(JSON.stringify(out))
+"""
+
+
+def win(cls, x, y, w, h):
+    return {"class": cls, "name": cls, "desktop": "", "x": x, "y": y, "w": w, "h": h}
+
+
+def guillotine(box, depth, seed):
+    """Windows filling box through random straight cuts, 8 px apart, like a tiled workspace."""
+    state = [seed]
+
+    def rand():
+        state[0] = (state[0] * 1103515245 + 12345) % (1 << 31)
+        return state[0] / (1 << 31)
+
+    out = []
+
+    def cut(x, y, w, h, level):
+        if level >= depth or w < 200 or h < 200 or rand() < 0.2:
+            out.append(win(f"app{len(out)}", x + 4, y + 4, w - 8, h - 8))
+            return
+        across = (w >= h) == (rand() < 0.7)
+        span = w if across else h
+        edges = [0] + sorted(int(rand() * span) for _ in range(1 + int(rand() * 2))) + [span]
+        for a, b in zip(edges, edges[1:]):
+            if b - a < 60:
+                continue
+            if across:
+                cut(x + a, y, b - a, h, level + 1)
+            else:
+                cut(x, y + a, w, b - a, level + 1)
+
+    cut(*box, 0)
+    return out
+
+
+class Snapshot(Sandbox):
+    def client(self, cls, x, y, w, h, ws=3, **extra):
+        return {"address": "0x1", "class": cls, "workspace": {"id": ws}, "floating": False, "mapped": True,
+                "hidden": False, "at": [x, y], "size": [w, h], **extra}
+
+    def arranged(self, ws=3):
+        return [self.client("code", 12, 39, 939, 949, ws), self.client("foot", 965, 39, 623, 468, ws),
+                self.client("org.telegram.desktop", 965, 521, 623, 467, ws)]
+
+    def windows_of(self, clients):
+        return [win(c["class"], *c["at"], *c["size"]) for c in clients]
+
+    def assertTreesEqual(self, got, want):
+        if "children" in want:
+            self.assertEqual((got["dir"], len(got["children"]), len(got["sizes"])),
+                             (want["dir"], len(want["children"]), len(want["sizes"])))
+            for a, b in zip(got["sizes"], want["sizes"]):
+                self.assertAlmostEqual(a, b, places=9)
+            for a, b in zip(got["children"], want["children"]):
+                self.assertTreesEqual(a, b)
+        else:
+            self.assertEqual(got, want)
+
+    def test_capture_reads_columns_and_rows(self):
+        tree = self.h.capture_tree(self.windows_of(self.arranged()))
+        self.assertEqual(tree["dir"], "h")
+        self.assertEqual(round(tree["sizes"][0], 2), 0.6)
+        self.assertEqual(tree["children"][1]["dir"], "v")
+        self.assertEqual([c["apps"][0]["class"] for c in tree["children"][1]["children"]], ["foot", "org.telegram.desktop"])
+        shared = self.h.capture_tree([win("a", 0, 0, 800, 800), win("b", 400, 400, 800, 800), win("A", 10, 10, 50, 50)])
+        self.assertEqual([a["class"] for a in shared["apps"]], ["a", "b"])
+        self.assertEqual(self.h.capture_tree([]), {"id": "t1", "apps": []})
+
+    def test_capture_matches_the_editor(self):
+        node = "/usr/bin/node"
+        if not os.path.exists(node):
+            self.skipTest("node not installed")
+        cases = [self.windows_of(self.arranged()),
+                 [win("a", 0, 0, 800, 800), win("b", 400, 400, 800, 800)],
+                 [win("solo", 5, 5, 1000, 700)], [],
+                 [win("a", 0, 0, 500, 500), win("b", 490, 0, 500, 500), win("c", 0, 510, 990, 300)],
+                 [win("a", 0, 0, 600, 900), win("a", 610, 0, 600, 440), win("b", 610, 450, 600, 450)]]
+        cases += [guillotine((0, 0, 2560, 1440), 4, seed) for seed in range(1, 60)]
+        r = subprocess.run([node, "-e", NODE_CAPTURE, str(ROOT / "BlueprintModel.js"), json.dumps(cases)],
+                           capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr.decode())
+        expected = json.loads(r.stdout)
+        self.assertEqual(len(expected), len(cases))
+        self.assertGreater(max(len(c) for c in cases), 6)
+        for case, want in zip(cases, expected):
+            self.assertTreesEqual(self.h.capture_tree(case), want)
+
+    def test_snapshot_saves_the_focused_workspace_and_applies(self):
+        self.active = {"id": 3}
+        self.clients = self.arranged() + [self.client("stray", 0, 0, 10, 10, ws=2),
+                                          self.client("float", 1, 1, 50, 50, floating=True)]
+        code, out, err = self.capture(self.h.cmd_snapshot, [])
+        self.assertEqual(code, 0, err)
+        saved = json.loads(self.h.CONFIG.read_text())
+        ws = saved["workspaces"]["3"]
+        self.assertEqual((ws["pin"], ws["launch"]), (False, False))
+        self.assertEqual(sorted(a["class"] for a in self.h.apps_of(ws["root"])), ["code", "foot", "org.telegram.desktop"])
+        self.assertEqual(self.h.CONFIG.stat().st_mode & 0o777, 0o600)
+        self.assertIn(["reload"], self.calls)
+        self.assertIn('workspace = "3"', self.h.GENERATED.read_text())
+        self.assertEqual(self.notes[-1][0], "Workspace 3 saved as a blueprint")
+        self.assertIn("3 tiles", self.notes[-1][1])
+        self.assertIn("Layout only", self.notes[-1][1])
+
+    def test_snapshot_keeps_flags_and_other_workspaces(self):
+        doc = document(w2=leaf(["foot"]), w3=leaf(["old"]))
+        doc["workspaces"]["3"].update(pin=True, launch=False)
+        self.write_config(doc)
+        self.clients = self.arranged()
+        code, _, err = self.capture(self.h.cmd_snapshot, ["3"])
+        self.assertEqual(code, 0, err)
+        saved = json.loads(self.h.CONFIG.read_text())["workspaces"]
+        self.assertEqual(sorted(saved), ["2", "3"])
+        self.assertEqual((saved["3"]["pin"], saved["3"]["launch"]), (True, False))
+        self.assertNotIn('"old"', json.dumps(saved["3"]))
+        self.assertIn("Replaced", self.notes[-1][1])
+
+    def test_snapshot_refusals_change_nothing(self):
+        self.write_config(document(w2=leaf(["foot"])))
+        before = self.h.CONFIG.read_bytes()
+        for args in (["0"], ["100"], ["1", "2"], ["3;x"], ["-1"]):
+            self.assertEqual(self.capture(self.h.cmd_snapshot, args)[0], 2, args)
+        self.clients = self.arranged()
+        self.active = {"id": -98}                    # a special workspace
+        self.assertEqual(self.capture(self.h.cmd_snapshot, [])[0], 1)
+        self.active = {"id": 4}                      # nothing tiled there
+        self.assertEqual(self.capture(self.h.cmd_snapshot, [])[0], 1)
+        self.assertEqual(self.h.CONFIG.read_bytes(), before)
+        self.assertNotIn(["reload"], self.calls)
+
+    def test_snapshot_respects_limits_and_unreadable_files(self):
+        self.write_config({"workspaces": {str(i): {"root": leaf([f"a{i}"])} for i in range(1, 11)}})
+        self.clients = self.arranged(ws=12)
+        before = self.h.CONFIG.read_bytes()
+        self.assertEqual(self.capture(self.h.cmd_snapshot, ["12"])[0], 1)
+        self.assertEqual(self.h.CONFIG.read_bytes(), before)
+        self.assertIn("10 workspaces", self.notes[-1][1])
+        broken = document(w2=leaf(["foot"]))
+        broken["workspaces"]["4"] = {"root": split(*[leaf() for _ in range(65)])}
+        self.write_config(broken)
+        before = self.h.CONFIG.read_bytes()
+        self.clients = self.arranged()
+        self.assertEqual(self.capture(self.h.cmd_snapshot, ["3"])[0], 1)
+        self.assertEqual(self.h.CONFIG.read_bytes(), before)
+        self.write_config(None, b"{not json")
+        self.assertEqual(self.capture(self.h.cmd_snapshot, ["3"])[0], 1)
+        self.assertEqual(self.h.CONFIG.read_bytes(), b"{not json")
+        self.assertNotIn(["reload"], self.calls)
+
+    def test_too_many_windows_for_one_blueprint(self):
+        self.clients = [self.client(f"app{i}", i * 30, 0, 20, 20) for i in range(70)]
+        self.assertEqual(self.capture(self.h.cmd_snapshot, ["3"])[0], 1)
+        self.assertFalse(self.h.CONFIG.exists())
+        self.assertIn("64", self.notes[-1][1])
+
+
 # ------------------------------------------------------------------ packaging
 
 class Packaging(unittest.TestCase):
@@ -745,14 +916,32 @@ class Packaging(unittest.TestCase):
         self.assertEqual(source.count("os.open("), 1)
 
     def test_qml_talks_only_to_the_helper(self):
+        files = sorted(ROOT.glob("*.qml"))
+        self.assertEqual([p.name for p in files], ["EditorCard.qml", "EditorPanel.qml", "TileBlueprints.qml"])
+        for path in files:
+            text = path.read_text()
+            for forbidden in ('"hyprctl"', "execDetached", "FileView", "bash", '"sh"', "command:"):
+                self.assertFalse(forbidden in text, (path.name, forbidden))
+            if path.name != "TileBlueprints.qml":
+                self.assertNotIn("Process", text, path.name)
         qml = (ROOT / "TileBlueprints.qml").read_text()
-        for forbidden in ('"hyprctl"', "execDetached", "FileView", "bash", '"sh"', "command:"):
-            self.assertFalse(forbidden in qml, forbidden)
         for required in ('readonly property string python: "/usr/bin/python3"',
                          "proc.command = [root.python, root.helper].concat(args)",
                          "stdinEnabled: true", '["write", "--background"]', '["active-workspace"]',
                          "target.signal(15)", "target.signal(9)"):
             self.assertTrue(required in qml, required)
+
+    def test_editor_stays_loaded_so_it_can_ask_before_closing(self):
+        manifest = json.loads((ROOT / "manifest.json").read_text())
+        self.assertIs(manifest["keepLoaded"], True)
+        self.assertIn("PanelWindow", (ROOT / "EditorPanel.qml").read_text())
+        self.assertNotIn("PanelWindow", (ROOT / "TileBlueprints.qml").read_text())
+
+    def test_menu_snippet_parses_and_offers_snapshot(self):
+        import re
+        raw = (ROOT / "menu.jsonc").read_text()
+        routes = json.loads("{" + re.sub(r",(\s*)$", r"\1", raw.rstrip()) + "}")
+        self.assertEqual(routes["setup.tile-blueprints.snapshot"]["action"], "@PLUGIN_BIN@/tile-blueprints snapshot")
 
     def test_cli_rejections_end_to_end(self):
         sandbox = tempfile.mkdtemp(prefix="tile-blueprints-cli.", dir=safe.runtime_dir())
