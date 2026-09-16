@@ -8,6 +8,7 @@
                                        to a bounded detached helper and returns at once
   tile-blueprints apply                regenerate the Hyprland layout file, reload, arrange
   tile-blueprints arrange              move running apps to the workspaces they are pinned to
+  tile-blueprints launch               start the apps that open at login, now
   tile-blueprints windows <ws>         tiled windows on a workspace, as JSON (for capture)
   tile-blueprints monitors            connected displays the editor can pin a workspace to, JSON
   tile-blueprints snapshot [<ws>]      save the windows on a workspace (default: the focused one)
@@ -496,6 +497,29 @@ def launch_tools():
         return None
 
 
+def spawn(argv, timeout=10.0):
+    """Start a program and walk away. Every launch goes through here, so a test can see it."""
+    return safe.spawn(argv, timeout=timeout)
+
+
+def login_launches(doc):
+    """The desktop ids that open at login, in workspace order: what the generated file starts
+    and what `launch` starts now. An app whose desktop id gtk-launch could not take is left
+    out (a web app often has none), the same way the generated file leaves it out."""
+    out = []
+    for _key, ws in workspaces(doc):
+        if not ws["launch"]:
+            continue
+        for app in apps_of(ws["root"]):
+            if valid_class(app["class"]) and valid_desktop(app["desktop"]) and app["desktop"] not in out:
+                out.append(app["desktop"])
+        for window in ws.get("floating", []):
+            desktop = window.get("desktop", "")
+            if valid_desktop(desktop) and desktop not in out:
+                out.append(desktop)
+    return out
+
+
 # Omarchy binds window resizing to SUPER and the -/= keys, in four step sizes. Those
 # bindings go through Hyprland's own layout, which for a Lua layout means nothing happens
 # at all - there is no resize hook in the 0.56 layout API. So take the keys over: on a
@@ -630,7 +654,6 @@ def generate(doc):
         "",
     ]
     lines += resize_bindings()
-    launches = []
     for key, ws in pairs:
         rule = [f"workspace = {lua_str(key)}", f"layout = {lua_str('lua:' + LAYOUT_NAME)}"]
         if ws.get("monitor"):
@@ -649,9 +672,6 @@ def generate(doc):
                              f'workspace = {lua_str(key + " silent")} }})')
             if app.get("state"):
                 lines.append(state_rule(app["class"], app["state"]))
-            desktop = app["desktop"]
-            if ws["launch"] and valid_desktop(desktop) and desktop not in launches:
-                launches.append(desktop)
         # Floating windows are not part of the tiling, so they come back as rules: float
         # where they were, the size they were, pinned if they were pinned.
         for window in ws.get("floating", []):
@@ -665,9 +685,7 @@ def generate(doc):
             lines.append("hl.window_rule({ " + ", ".join(parts) + " })")
             if window.get("state"):
                 lines.append(state_rule(window["class"], window["state"]))
-            desktop = window.get("desktop", "")
-            if ws["launch"] and valid_desktop(desktop) and desktop not in launches:
-                launches.append(desktop)
+    launches = login_launches(doc)
     tools = launch_tools() if launches else None
     if tools:
         uwsm_app, gtk_launch = tools
@@ -849,6 +867,40 @@ def arrange(doc, budget=ARRANGE_BUDGET):
         if r is not None and r.ok:
             moved += 1
     return moved
+
+
+def cmd_launch(args):
+    """Start the apps that open at login, now, instead of waiting for Hyprland to restart.
+    Exactly what the generated file runs on hyprland.start, in the same order."""
+    if args:
+        return fail("launch takes no arguments", 2)
+    try:
+        doc, _ = load_config()
+    except Unreadable as e:
+        notify("Nothing was launched", str(e))
+        return fail(str(e))
+    desktops = login_launches(doc)
+    if not desktops:
+        notify("Nothing to launch", "No workspace opens its apps at login.")
+        return fail("no workspace opens its apps at login")
+    tools = launch_tools()
+    if not tools:
+        return fail("uwsm-app and gtk-launch were not found in /usr/bin")
+    uwsm_app, gtk_launch = tools
+    started = 0
+    for desktop in desktops:
+        try:
+            spawn([uwsm_app, "--", gtk_launch, desktop + ".desktop"])
+        except (safe.UnsafeError, OSError) as e:
+            print(f"skipped {clean_text(desktop, 200)}: {e}", file=sys.stderr)
+            continue
+        started += 1
+    if started == 0:
+        return fail("could not start any of the apps")
+    notify("Tile blueprints launching",
+           f"{started} app{'s' if started != 1 else ''} opening in their tiles.")
+    print(f"Launched {started} app(s).")
+    return 0
 
 
 def cmd_arrange(_args):
@@ -1431,6 +1483,7 @@ def cmd_set_sizes(args):
 
 COMMANDS = {
     "open": cmd_open, "config": cmd_config, "write": cmd_write, "apply": cmd_apply, "arrange": cmd_arrange,
+    "launch": cmd_launch,
     "set-sizes": cmd_set_sizes,
     "windows": cmd_windows, "monitors": cmd_monitors,
     "snapshot": cmd_snapshot, "apps": cmd_apps, "active-workspace": cmd_active_workspace,

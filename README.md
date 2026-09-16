@@ -162,7 +162,8 @@ edited**. The generated file:
 - sets that layout on each workspace that has a blueprint;
 - with **pin** on, adds a window rule per app so it opens on its workspace;
 - with **open at login** on, starts each app through its desktop entry
-  (`uwsm-app -- gtk-launch …`), the way Omarchy's launcher does;
+  (`uwsm-app -- gtk-launch …`), the way Omarchy's launcher does — or all at once, without
+  waiting for the next login, with `tile-blueprints launch`;
 - binds the resize keys to the layout, falling back to Hyprland's own resize elsewhere.
 
 ## Worth knowing
@@ -183,6 +184,7 @@ edited**. The generated file:
 tile-blueprints status     # what is configured, and what Hyprland is using
 tile-blueprints apply      # regenerate, reload, arrange
 tile-blueprints arrange    # just move running apps to their workspaces
+tile-blueprints launch     # start the apps that open at login, now
 tile-blueprints windows 2  # workspace 2 as JSON: {"tiled": [...], "floating": [...]}
 tile-blueprints monitors   # the displays a workspace can be pinned to, as JSON
 tile-blueprints snapshot   # save the windows on this workspace as its blueprint

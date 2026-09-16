@@ -1419,6 +1419,66 @@ class Snapshot(Sandbox):
 
 # ------------------------------------------------------------------ packaging
 
+class Launch(Sandbox):
+    def setUp(self):
+        super().setUp()
+        self.commands = []
+        self.h.launch_tools = lambda: ("/usr/bin/uwsm-app", "/usr/bin/gtk-launch")
+        # Every launch goes through the helper's own spawn, so nothing here starts a program.
+        self.h.spawn = lambda argv, timeout=None: self.commands.append(list(argv))
+
+    def app(self, cls, desktop=None):
+        return {"class": cls, "name": cls, "desktop": cls if desktop is None else desktop}
+
+    def test_launch_starts_the_login_apps_in_order(self):
+        doc = document(w1=leaf([self.app("firefox")]),
+                       w2=leaf([self.app("foot")]))
+        doc["workspaces"]["2"]["launch"] = False
+        doc["workspaces"]["3"] = {"root": leaf([self.app("obsidian"), {"class": "Google Messages", "desktop": ""}]),
+                                  "launch": True, "pin": True}
+        doc["workspaces"]["3"]["floating"] = [{"class": "htop", "desktop": "htop", "x": 1, "y": 2, "w": 3, "h": 4}]
+        self.write_config(doc)
+        code, out, err = self.capture(self.h.cmd_launch, [])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.commands, [
+            ["/usr/bin/uwsm-app", "--", "/usr/bin/gtk-launch", "firefox.desktop"],
+            ["/usr/bin/uwsm-app", "--", "/usr/bin/gtk-launch", "obsidian.desktop"],
+            ["/usr/bin/uwsm-app", "--", "/usr/bin/gtk-launch", "htop.desktop"],
+        ])
+        self.assertIn("3 app", out)
+        self.assertEqual(self.notes[-1][0], "Tile blueprints launching")
+
+    def test_launch_is_what_the_generated_file_would_have_run(self):
+        doc = document(w1=leaf([self.app("firefox"), self.app("foot", "")]),
+                       w2=leaf([self.app("obsidian")]))
+        doc["workspaces"]["2"]["launch"] = False
+        normalized, _ = self.h.normalize_document(doc)
+        text = self.h.generate(normalized)
+        in_file = [line.split("gtk-launch ")[1].rsplit(".desktop", 1)[0]
+                   for line in text.splitlines() if "gtk-launch " in line and "hl.exec_cmd" in line]
+        self.assertEqual(self.h.login_launches(normalized), in_file)
+        self.assertEqual(self.h.login_launches(normalized), ["firefox"])
+
+    def test_launch_says_so_when_nothing_opens_at_login(self):
+        doc = document(w1=leaf([self.app("firefox")]))
+        doc["workspaces"]["1"]["launch"] = False
+        self.write_config(doc)
+        code, _, err = self.capture(self.h.cmd_launch, [])
+        self.assertEqual(code, 1)
+        self.assertEqual(self.commands, [])
+        self.assertIn("login", self.notes[-1][1])
+
+    def test_launch_needs_the_launchers_and_takes_no_arguments(self):
+        self.write_config(document(w1=leaf([self.app("firefox")])))
+        self.assertEqual(self.capture(self.h.cmd_launch, ["1"])[0], 2)
+        self.h.launch_tools = lambda: None
+        self.assertEqual(self.capture(self.h.cmd_launch, [])[0], 1)
+        self.assertEqual(self.commands, [])
+        self.write_config(None, b"{not json")
+        self.assertEqual(self.capture(self.h.cmd_launch, [])[0], 1)
+        self.assertEqual(self.commands, [])
+
+
 class Packaging(unittest.TestCase):
     def test_interpreters_and_vendored_library(self):
         for script in ("tile-blueprints", "tile-blueprints-menu-install"):
@@ -1481,6 +1541,7 @@ class Packaging(unittest.TestCase):
             self.assertEqual(run(["write", "--background"], b"x" * (600 * 1024)).returncode, 2)
             self.assertEqual(run(["windows", "1;reboot"]).returncode, 2)
             self.assertEqual(run(["nonsense"]).returncode, 2)
+            self.assertEqual(run(["launch", "1"]).returncode, 2)
             config = run(["config"])
             self.assertEqual(config.returncode, 0)
             self.assertEqual(json.loads(config.stdout)["workspaces"], {})
