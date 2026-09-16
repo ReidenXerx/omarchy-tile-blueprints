@@ -100,8 +100,8 @@ io.write(table.concat(out, "\n"), "\n")
 
 
 LUA_RESIZE_HARNESS = r"""
-local path, classes, active, axis, delta = ...
-local registered, exec = nil, {}
+local path, classes, active, axis, delta, times = ...
+local registered, exec, timers = nil, {}, {}
 ACTIVE = nil
 hl = {
   layout = { register = function(name, t) registered = t end },
@@ -113,7 +113,7 @@ hl = {
   unbind = function() end,
   dispatch = function() end,
   dsp = { window = { resize = function(t) return t end } },
-  timer = function(fn) fn() return {} end,
+  timer = function(fn) timers[#timers + 1] = fn return {} end,
   get_active_window = function() return ACTIVE end,
 }
 dofile(path)
@@ -134,8 +134,12 @@ local ctx = {
 
 registered.recalculate(ctx)
 ACTIVE = targets[tonumber(active)].window
-local moved = __omarchy_tiles.resize(axis, tonumber(delta))
-registered.recalculate(ctx)
+local moved = false
+for _ = 1, tonumber(times or 1) do
+  moved = __omarchy_tiles.resize(axis, tonumber(delta))
+  registered.recalculate(ctx)
+end
+for _, fn in ipairs(timers) do fn() end
 
 io.write("moved ", tostring(moved), "\n")
 for i, target in ipairs(targets) do
@@ -392,13 +396,13 @@ class Resize(Sandbox):
                 "children": [leaf([{"class": "foot", "name": "Foot", "desktop": ""}]),
                              leaf([{"class": "code", "name": "Code", "desktop": ""}])]}
 
-    def resize_run(self, doc, classes, active, axis, delta):
+    def resize_run(self, doc, classes, active, axis, delta, times=1):
         text = self.h.generate(self.h.normalize_document(doc, strict=True)[0])
         path = self.dir / "generated.lua"
         path.write_text(text)
         harness = self.dir / "resize.lua"
         harness.write_text(LUA_RESIZE_HARNESS)
-        r = self.lua("lua", str(harness), str(path), classes, str(active), axis, str(delta))
+        r = self.lua("lua", str(harness), str(path), classes, str(active), axis, str(delta), str(times))
         self.assertTrue(r.ok, r.stderr.decode())
         return r.stdout.decode()
 
@@ -453,9 +457,19 @@ class Resize(Sandbox):
 
     def test_the_only_program_the_generated_file_names_is_the_helper(self):
         text = self.h.generate(self.h.normalize_document(document(w1=leaf(["foot"])), strict=True)[0])
-        execs = [line for line in text.splitlines() if "exec_cmd" in line]
-        self.assertEqual(execs, ['      hl.exec_cmd(command .. " set-sizes " .. key .. " \'" .. table.concat(parts, ";") .. "\'")'])
+        execs = [line.strip() for line in text.splitlines() if "hl.exec_cmd(" in line]
+        self.assertEqual(len(execs), 2)                       # the two calls back into this helper
+        for line in execs:
+            self.assertIn("hl.exec_cmd(command ..", line)   # always this helper, never a name from the document
         self.assertIn(f'__omarchy_tiles.persist = "{self.h.SELF}"', text)
+
+    def test_a_run_of_resizes_saves_once_and_syncs_once(self):
+        out = self.resize_run(document(w1=self.split()), "foot,code", 1, "x", -20, times=5)
+        saves = [line for line in out.splitlines() if "set-sizes" in line]
+        syncs = [line for line in out.splitlines() if "sync-layout" in line]
+        self.assertEqual(len(saves), 1, out)      # one write of the document for the whole run
+        self.assertEqual(len(syncs), 1, out)      # and one catch-up of the layout file
+        self.assertIn("0.4000,0.6000", saves[0])  # carrying where the border ended up
 
     # ---- applying without a full reload
 
@@ -543,11 +557,29 @@ class Resize(Sandbox):
         doc = json.loads(self.h.CONFIG.read_bytes())
         self.assertEqual([round(v, 3) for v in doc["workspaces"]["1"]["root"]["children"][1]["sizes"]], [0.2, 0.8])
 
-    def test_set_sizes_writes_the_layout_file_but_does_not_reload(self):
+    def test_set_sizes_touches_the_document_only(self):
         self.write_config(document(w1=self.split()))
+        self.capture(self.h.cmd_apply, [])
+        before = self.h.GENERATED.read_bytes()
+        self.calls.clear()
         self.capture(self.h.cmd_set_sizes, ["1", "s:=0.3,0.7"])
-        self.assertTrue(self.h.GENERATED.exists())
+        self.assertEqual(self.h.GENERATED.read_bytes(), before)   # no write, so no auto-reload
         self.assertEqual(self.calls, [])
+
+    def test_sync_layout_catches_the_file_up_once(self):
+        self.write_config(document(w1=self.split()))
+        self.capture(self.h.cmd_apply, [])
+        self.capture(self.h.cmd_set_sizes, ["1", "s:=0.3,0.7"])
+        before = self.h.GENERATED.read_bytes()
+        self.calls.clear()
+        self.assertEqual(self.capture(self.h.cmd_sync_layout, [])[0], 0)
+        after = self.h.GENERATED.read_bytes()
+        self.assertNotEqual(after, before)
+        self.assertIn(b"0.3", after)
+        self.assertEqual(self.calls, [])                          # it never reloads by itself
+        stamp = self.h.GENERATED.stat().st_mtime_ns
+        self.assertEqual(self.capture(self.h.cmd_sync_layout, [])[0], 0)
+        self.assertEqual(self.h.GENERATED.stat().st_mtime_ns, stamp)   # already in step: left alone
 
     def test_set_sizes_refuses_what_it_cannot_read(self):
         self.write_config(document(w1=self.split()))

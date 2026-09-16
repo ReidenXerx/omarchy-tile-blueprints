@@ -99,7 +99,9 @@ or at login until you turn that on in the editor.
 `SUPER + -` and `SUPER + =` resize the focused window, in four steps: alone for 100px, with
 `ALT` for 25, with `CTRL` for 300, and with `SHIFT` for the vertical border instead of the
 horizontal one. **The new proportion is saved into the blueprint**, about half a second
-after you stop pressing, so the workspace opens that way next time. Nothing else in the
+after you stop pressing, so the workspace opens that way next time. A whole run of
+keystrokes costs one write, and the layout file Hyprland watches is brought back in step a
+few seconds later, so a burst of resizing never turns into a burst of config reloads. Nothing else in the
 blueprint changes, and resizing back is the undo.
 
 It works both between tiles and between windows that share one tile. A border stops rather

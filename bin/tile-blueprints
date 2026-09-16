@@ -13,8 +13,10 @@
                                        as its blueprint, then apply
   tile-blueprints apps                 apps to assign: running windows and installed apps, JSON
   tile-blueprints active-workspace     the focused workspace id, as JSON
-  tile-blueprints set-sizes <ws> <p>   store new split shares ('path=a,b;path=a,b,c'), no
-                                       reload; the layout engine calls this after a resize
+  tile-blueprints set-sizes <ws> <p>   store new shares ('s:path=a,b;w:path=a,b') in the
+                                       blueprint; the layout engine calls this after a resize
+  tile-blueprints sync-layout          rewrite the layout file if it has drifted from the
+                                       blueprints (what a resize leaves behind), no reload
   tile-blueprints status               what is configured and whether Hyprland has it
   tile-blueprints remove               delete the generated layout file and reload
 
@@ -659,6 +661,9 @@ def apply_document(doc):
         previous = safe.read_file(GENERATED, GENERATED_MAX)
     except (safe.UnsafeError, safe.TooLarge, OSError):
         previous = None
+    if previous is not None and previous.decode("utf-8", "replace") == text:
+        # Nothing to write, so nothing to reload: the file already says this.
+        return [], arrange(doc)
     if previous is not None and rules_outside_trees(text) is not None:
         try:
             same_rules = rules_outside_trees(previous.decode("utf-8")) == rules_outside_trees(text)
@@ -1209,14 +1214,37 @@ def cmd_set_sizes(args):
         blob = serialize_config(doc)
     except Invalid as e:
         return fail(f"set-sizes: {e}")
+    # Only the document. The layout file is what Hyprland watches, and rewriting it costs a
+    # full config reload, so `sync-layout` catches it up once the keys have stopped.
     safe.write_file(CONFIG, blob, mode=0o600)
-    safe.write_file(GENERATED, generate(doc), mode=0o644)
+    return 0
+
+
+def cmd_sync_layout(_args):
+    """sync-layout - rewrite the layout file from the saved blueprints if it has drifted.
+
+    Called a few seconds after the last resize. Writing the file makes Hyprland re-read its
+    whole config, so an unchanged file is left exactly as it is."""
+    try:
+        doc, _ = load_config()
+    except Unreadable as e:
+        return fail(str(e))
+    if not doc["workspaces"]:
+        return 0
+    text = generate(doc)
+    try:
+        previous = safe.read_file(GENERATED, GENERATED_MAX)
+    except (safe.UnsafeError, safe.TooLarge, OSError):
+        previous = None
+    if previous is not None and previous.decode("utf-8", "replace") == text:
+        return 0
+    safe.write_file(GENERATED, text, mode=0o644)
     return 0
 
 
 COMMANDS = {
     "open": cmd_open, "config": cmd_config, "write": cmd_write, "apply": cmd_apply, "arrange": cmd_arrange,
-    "set-sizes": cmd_set_sizes,
+    "set-sizes": cmd_set_sizes, "sync-layout": cmd_sync_layout,
     "windows": cmd_windows, "snapshot": cmd_snapshot, "apps": cmd_apps, "active-workspace": cmd_active_workspace,
     "status": cmd_status, "remove": cmd_remove,
 }

@@ -217,10 +217,15 @@ end
 
 -- Changed splits waiting to be written to the blueprint, keyed by workspace then by the
 -- dotted child path of the split. Keystrokes repeat, so the write is debounced.
-local pending, save_timer = {}, nil
+local pending, save_queued = {}, false
+
+-- The layout file is separate and slower: Hyprland watches the files it loaded, so writing
+-- it makes the compositor re-read every config file. The screen is already right by then,
+-- so it waits until the keys have stopped. Each resize takes a ticket and only the last
+-- one left goes through, which is a debounce without needing to cancel a timer.
+local sync_epoch = 0
 
 local function flush_saves()
-  save_timer = nil
   local command = __omarchy_tiles.persist
   for key, splits in pairs(pending) do
     local parts = {}
@@ -236,14 +241,31 @@ local function flush_saves()
   pending = {}
 end
 
+local function sync_layout()
+  local command = __omarchy_tiles.persist
+  if command then hl.exec_cmd(command .. " sync-layout") end
+end
+
 local function remember(key, kind, path, values)
   local copy = {}
   for i, value in ipairs(values) do copy[i] = value end
   pending[key] = pending[key] or {}
   pending[key][kind .. ":" .. path] = copy
-  if not save_timer and hl.timer then
-    save_timer = hl.timer(flush_saves, { type = "oneshot", timeout = 400 })
+  if not hl.timer then return end
+  -- The flag goes up before the timer is made, so the state cannot get stuck if a timer
+  -- ever runs its callback straight away.
+  if not save_queued then
+    save_queued = true
+    hl.timer(function()
+      save_queued = false
+      flush_saves()
+    end, { type = "oneshot", timeout = 400 })
   end
+  sync_epoch = sync_epoch + 1
+  local ticket = sync_epoch
+  hl.timer(function()
+    if ticket == sync_epoch then sync_layout() end
+  end, { type = "oneshot", timeout = 5000 })
 end
 
 -- Move a border by delta pixels, taking from one side and giving to the other. Returns
