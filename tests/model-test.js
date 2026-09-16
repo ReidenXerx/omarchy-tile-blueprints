@@ -300,6 +300,14 @@ test("listNumbers reads like a sentence", () => {
   assert.strictEqual(M.listNumbers([1, 2, 10]), "1, 2 and 10")
 })
 
+test("a tile keeps the shares a resize wrote, and drops nonsense", () => {
+  const kept = M.normalize({ id: "t1", apps: [], shares: [0.3, 0.7] })
+  eq(kept.shares, [0.3, 0.7])
+  for (const bad of [[1], [0.5, "x"], [0.5, -1], "0.5,0.5"]) {
+    assert.strictEqual(M.normalize({ id: "t1", apps: [], shares: bad }).shares, undefined)
+  }
+})
+
 console.log(`${passed} passed, ${failures.length} failed`)
 for (const f of failures) console.log("  FAIL " + f)
 process.exit(failures.length ? 1 : 0)

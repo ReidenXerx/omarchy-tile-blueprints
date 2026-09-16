@@ -13,6 +13,8 @@
                                        as its blueprint, then apply
   tile-blueprints apps                 apps to assign: running windows and installed apps, JSON
   tile-blueprints active-workspace     the focused workspace id, as JSON
+  tile-blueprints set-sizes <ws> <p>   store new split shares ('path=a,b;path=a,b,c'), no
+                                       reload; the layout engine calls this after a resize
   tile-blueprints status               what is configured and whether Hyprland has it
   tile-blueprints remove               delete the generated layout file and reload
 
@@ -80,6 +82,7 @@ CONFIG_MAX = 512 * 1024           # blueprint file on disk
 STDIN_MAX = 512 * 1024            # document handed to `write`
 STDIN_TIMEOUT = 10.0              # ... which must arrive within this long
 ENGINE_MAX = 64 * 1024
+GENERATED_MAX = 1024 * 1024       # the layout file this plugin writes, read back to compare
 DESKTOP_FILE_MAX = 64 * 1024
 DIR_SCAN_MAX = 10000              # directory entries looked at per applications folder
 ICON_FILE_MAX = 4 * 1024 * 1024
@@ -90,6 +93,7 @@ OUTPUT_MAX = 2 * 1024 * 1024      # bytes of JSON a listing prints
 MAX_WORKSPACES = 10
 MAX_WORKSPACE_ID = 99
 MAX_TILES = 64                    # per workspace
+MAX_WINDOW_SHARES = 16            # windows whose split inside one tile is remembered
 MAX_APPS_PER_TILE = 32
 MAX_DEPTH = 16                    # split levels
 MAX_TEXT = 256                    # class and name length
@@ -261,6 +265,13 @@ def _normalize_tree(node, state, depth):
                      "desktop": desktop if valid_desktop(desktop) else ""})
     leaf_id = node.get("id")
     leaf = {"id": leaf_id if isinstance(leaf_id, str) and LEAF_ID.fullmatch(leaf_id) else None, "apps": apps}
+    # Shares for windows that end up in this one tile, written by a resize. They are
+    # positional and only used when the count still matches, so a stale list is ignored
+    # rather than wrong.
+    shares = node.get("shares")
+    if isinstance(shares, list) and 2 <= len(shares) <= MAX_WINDOW_SHARES:
+        if all(_positive(value) is not None for value in shares):
+            leaf["shares"] = normalize_sizes(shares, len(shares))
     state["leaves"].append(leaf)
     return leaf
 
@@ -395,7 +406,10 @@ def engine_tree(node):
     if "children" in node:
         return {"dir": node["dir"], "sizes": list(node["sizes"]),
                 "children": [engine_tree(c) for c in node["children"]]}
-    return {"name": node["id"], "apps": [a["class"] for a in node["apps"]]}
+    leaf = {"name": node["id"], "apps": [a["class"] for a in node["apps"]]}
+    if node.get("shares"):
+        leaf["shares"] = list(node["shares"])
+    return leaf
 
 
 def class_regex(cls):
@@ -417,6 +431,92 @@ def launch_tools():
         return None
 
 
+# Omarchy binds window resizing to SUPER and the -/= keys, in four step sizes. Those
+# bindings go through Hyprland's own layout, which for a Lua layout means nothing happens
+# at all - there is no resize hook in the 0.56 layout API. So take the keys over: on a
+# workspace with a blueprint the engine moves the border and saves it, and everywhere else
+# the original dispatch runs, unchanged.
+#
+# Both spellings are unbound first. Omarchy writes them as "code:20"/"code:21", which
+# Hyprland 0.56.2's Lua parser mis-reads (it keeps the whole chord as the key name, so the
+# binding is dead on arrival); a user who has already worked around that has them on the
+# key names instead. Binding a key twice keeps the first one, so the unbinds matter.
+RESIZE_KEYS = [
+    ("SUPER + ", 20, "x", -100, "Expand window left"),
+    ("SUPER + ", 21, "x", 100, "Shrink window left"),
+    ("SUPER + SHIFT + ", 20, "y", -100, "Shrink window up"),
+    ("SUPER + SHIFT + ", 21, "y", 100, "Expand window down"),
+    ("SUPER + ALT + ", 20, "x", -25, "Expand window left a little"),
+    ("SUPER + ALT + ", 21, "x", 25, "Shrink window left a little"),
+    ("SUPER + SHIFT + ALT + ", 20, "y", -25, "Shrink window up a little"),
+    ("SUPER + SHIFT + ALT + ", 21, "y", 25, "Expand window down a little"),
+    ("SUPER + CTRL + ", 20, "x", -300, "Expand window left a lot"),
+    ("SUPER + CTRL + ", 21, "x", 300, "Shrink window left a lot"),
+    ("SUPER + CTRL + SHIFT + ", 20, "y", -300, "Shrink window up a lot"),
+    ("SUPER + CTRL + SHIFT + ", 21, "y", 300, "Expand window down a lot"),
+]
+KEY_NAMES = {20: "minus", 21: "equal"}
+
+
+def resize_bindings():
+    lines = [
+        "-- Window resizing: the engine on a blueprint workspace, Hyprland's own elsewhere.",
+        "local function tile_resize(axis, delta)",
+        "  return function()",
+        "    if not (__omarchy_tiles.resize and __omarchy_tiles.resize(axis, delta)) then",
+        "      hl.dispatch(hl.dsp.window.resize({",
+        '        x = axis == "x" and delta or 0,',
+        '        y = axis == "y" and delta or 0,',
+        "        relative = true,",
+        "      }))",
+        "    end",
+        "  end",
+        "end",
+        "",
+    ]
+    for mods, code, axis, delta, description in RESIZE_KEYS:
+        name = KEY_NAMES[code]
+        lines.append(f'pcall(hl.unbind, {lua_str(f"{mods}code:{code}")})')
+        lines.append(f'pcall(hl.unbind, {lua_str(mods + name)})')
+        lines.append(
+            f'hl.bind({lua_str(mods + name)}, tile_resize({lua_str(axis)}, {delta}), '
+            f'{{ description = {lua_str(description)} }})'
+        )
+    lines.append("")
+    return lines
+
+
+TREES_OPEN = "-- >>> blueprint trees (apply replaces these live when nothing else changed)"
+TREES_CLOSE = "-- <<< blueprint trees"
+
+
+def trees_lua(doc):
+    """The workspaces table the engine reads, as a Lua literal."""
+    return lua_value({k: engine_tree(ws["root"]) for k, ws in workspaces(doc) if WORKSPACE_KEY.fullmatch(k)})
+
+
+def rules_outside_trees(text):
+    """The generated file with the trees cut out - everything a config reload is for
+    (the layout registration, workspace and window rules, launches, bindings). None when the
+    markers are missing, which is how a file from an older version reads."""
+    start, end = text.find(TREES_OPEN), text.find(TREES_CLOSE)
+    if start < 0 or end < 0:
+        return None
+    return text[:start] + text[end:]
+
+
+def push_trees(doc):
+    """Hand the running Hyprland the new trees and let the layout re-tile, with no config
+    reload: seconds of re-reading every Omarchy file turn into about 30ms. The Lua is built
+    the same way as the generated file, so a class name is still a quoted literal, never
+    code. False when Hyprland did not take it, and then the caller reloads as usual."""
+    lua = ("__omarchy_tiles.workspaces = " + trees_lua(doc) + "\n"
+           # The focused workspace may be on another layout, which rejects the message.
+           'pcall(function() hl.dispatch(hl.dsp.layout("reload")) end)')
+    r = hyprctl(["eval", lua], timeout=HYPR_TIMEOUT, max_output=64 * 1024)
+    return bool(r is not None and r.ok and r.text().strip().startswith("ok"))
+
+
 def generate(doc):
     """The Lua layout file for a normalized document."""
     engine = read_engine()
@@ -429,7 +529,14 @@ def generate(doc):
         engine.rstrip(),
         "end)()",
         "",
-        "__omarchy_tiles = { workspaces = " + lua_value({k: engine_tree(ws["root"]) for k, ws in pairs}) + " }",
+        # The engine has already created the table and hung its own entry points off it
+        # (resize, called by the bindings below), so fill this one in rather than replace it.
+        # The markers let apply see whether an edit changed only the trees, which the running
+        # compositor can be handed directly instead of re-reading the whole config.
+        TREES_OPEN,
+        "__omarchy_tiles.workspaces = " + trees_lua(doc),
+        TREES_CLOSE,
+        f"__omarchy_tiles.persist = {lua_str(str(SELF))}",
         "",
         f'hl.layout.register({lua_str(LAYOUT_NAME)}, {{',
         "  recalculate = function(ctx) return engine.recalculate(ctx) end,",
@@ -437,6 +544,7 @@ def generate(doc):
         "})",
         "",
     ]
+    lines += resize_bindings()
     launches = []
     for key, ws in pairs:
         lines.append(f'hl.workspace_rule({{ workspace = {lua_str(key)}, layout = {lua_str("lua:" + LAYOUT_NAME)} }})')
@@ -530,13 +638,39 @@ def cmd_write(args):
     except Invalid as e:
         return fail(f"write: {e}", 2)
     safe.write_file(CONFIG, blob, mode=0o600)
-    return spawn_apply() if args else cmd_apply([])
+    if not args:
+        return cmd_apply([])
+    # The editor saves in the background, so the tiles are handed to Hyprland here, in the
+    # process the person is waiting on, rather than one helper start later.
+    push_trees(doc)
+    return spawn_apply()
 
 
 def apply_document(doc):
-    """Write the generated layout file for doc, reload Hyprland and move pinned apps home.
-    Returns (Hyprland's errors about the file, windows moved); nothing moves after an error."""
-    safe.write_file(GENERATED, generate(doc), mode=0o644)
+    """Write the generated layout file for doc, put it into effect and move pinned apps home.
+    Returns (Hyprland's errors about the file, windows moved); nothing moves after an error.
+
+    Editing a blueprint usually only moves the tiles around, and for that the trees can go
+    straight into the running compositor - the windows follow at once instead of after a
+    full config reload. Anything else (a new workspace, pin or launch flipped, the plugin
+    updated) still goes the long way."""
+    text = generate(doc)
+    try:
+        previous = safe.read_file(GENERATED, GENERATED_MAX)
+    except (safe.UnsafeError, safe.TooLarge, OSError):
+        previous = None
+    if previous is not None and rules_outside_trees(text) is not None:
+        try:
+            same_rules = rules_outside_trees(previous.decode("utf-8")) == rules_outside_trees(text)
+        except UnicodeDecodeError:
+            same_rules = False
+        # The windows move first, and the file catches up behind them. Hyprland watches the
+        # files it loaded, so writing it still costs a reload - but by then the screen is
+        # already right, which is the part a person waits for.
+        if same_rules and push_trees(doc):
+            safe.write_file(GENERATED, text, mode=0o644)
+            return [], arrange(doc)
+    safe.write_file(GENERATED, text, mode=0o644)
     reload_hyprland()
     related = config_errors()
     return (related, 0) if related else ([], arrange(doc))
@@ -1001,8 +1135,88 @@ def cmd_status(_args):
     return 0
 
 
+SIZES_MAX = 4096                  # characters of one set-sizes payload
+SIZES_SPLITS = 64                 # splits one set-sizes call may touch
+
+
+def find_node(root, path):
+    """The node at a dotted child path ("" is the root), or None."""
+    node = root
+    if path:
+        for step in path.split("."):
+            if not step.isdigit():
+                return None
+            children = node.get("children")
+            index = int(step) - 1
+            if not isinstance(children, list) or not 0 <= index < len(children):
+                return None
+            node = children[index]
+    return node
+
+
+def cmd_set_sizes(args):
+    """set-sizes WORKSPACE 's:PATH=a,b;w:PATH=a,b' - store new shares, no reload.
+
+    The layout engine calls this after a resize keystroke: it has already moved the border
+    on screen, so the blueprint only has to catch up. Nothing else in the document moves,
+    and a workspace that is no longer in the file is not an error - the user deleted it
+    while a keystroke was in flight."""
+    if len(args) != 2:
+        return fail("set-sizes takes a workspace and one 'path=sizes;...' argument", 2)
+    key, payload = args
+    if not WORKSPACE_KEY.fullmatch(key):
+        return fail("set-sizes: not a workspace id", 2)
+    if len(payload) > SIZES_MAX:
+        return fail("set-sizes: payload too long", 2)
+    entries = [entry for entry in payload.split(";") if entry]
+    if not entries or len(entries) > SIZES_SPLITS:
+        return fail("set-sizes: expected 1 to %d splits" % SIZES_SPLITS, 2)
+
+    try:
+        doc, _ = load_config()
+    except Unreadable as e:
+        return fail(str(e))
+    space = doc["workspaces"].get(key)
+    if space is None:
+        return 0
+
+    for entry in entries:
+        where, sep, raw = entry.partition("=")
+        kind, _, path = where.partition(":")
+        if not sep or kind not in ("s", "w"):
+            return fail("set-sizes: expected s:path=sizes or w:path=shares", 2)
+        node = find_node(space["root"], path)
+        if node is None:
+            return 0  # the blueprint changed under us; the next apply wins
+        try:
+            values = [float(number) for number in raw.split(",")]
+        except ValueError:
+            return fail("set-sizes: sizes must be numbers", 2)
+        if not all(value == value and 0 < value < 1e6 for value in values):
+            return 0
+        if kind == "s":
+            # between tiles: one share per child of this split
+            if not isinstance(node.get("children"), list) or len(values) != len(node["children"]):
+                return 0
+            node["sizes"] = normalize_sizes(values, len(values))
+        else:
+            # inside one tile: one share per window sharing it, positional
+            if node.get("children") is not None or not 2 <= len(values) <= MAX_WINDOW_SHARES:
+                return 0
+            node["shares"] = normalize_sizes(values, len(values))
+
+    try:
+        blob = serialize_config(doc)
+    except Invalid as e:
+        return fail(f"set-sizes: {e}")
+    safe.write_file(CONFIG, blob, mode=0o600)
+    safe.write_file(GENERATED, generate(doc), mode=0o644)
+    return 0
+
+
 COMMANDS = {
     "open": cmd_open, "config": cmd_config, "write": cmd_write, "apply": cmd_apply, "arrange": cmd_arrange,
+    "set-sizes": cmd_set_sizes,
     "windows": cmd_windows, "snapshot": cmd_snapshot, "apps": cmd_apps, "active-workspace": cmd_active_workspace,
     "status": cmd_status, "remove": cmd_remove,
 }

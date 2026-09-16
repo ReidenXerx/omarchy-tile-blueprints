@@ -91,8 +91,24 @@ or at login until you turn that on in the editor.
   neighbours, so an unused slot never leaves a hole. The space comes back when the app
   opens.
 - **Unlisted windows share the largest tile.** Several windows in one tile split it evenly
-  along its longer side.
+  along its longer side, until you resize one.
 - **Workspaces without a blueprint are untouched** and keep whatever layout they had.
+
+## Resize on the workspace, not in the editor
+
+`SUPER + -` and `SUPER + =` resize the focused window, in four steps: alone for 100px, with
+`ALT` for 25, with `CTRL` for 300, and with `SHIFT` for the vertical border instead of the
+horizontal one. **The new proportion is saved into the blueprint**, about half a second
+after you stop pressing, so the workspace opens that way next time. Nothing else in the
+blueprint changes, and resizing back is the undo.
+
+It works both between tiles and between windows that share one tile. A border stops rather
+than swallowing its neighbour, and on a workspace without a blueprint the keys do what they
+always did.
+
+Hyprland's Lua layout API has no resize hook at all, so the plugin takes these keys over
+and drives the layout itself. (It also repairs them on the way: Omarchy writes them as
+`SUPER + code:20`, which Hyprland 0.56's Lua config parser mis-reads, leaving them dead.)
 
 ## How it works
 
@@ -106,14 +122,16 @@ edited**. The generated file:
 - sets that layout on each workspace that has a blueprint;
 - with **pin** on, adds a window rule per app so it opens on its workspace;
 - with **open at login** on, starts each app through its desktop entry
-  (`uwsm-app -- gtk-launch …`), the way Omarchy's launcher does.
+  (`uwsm-app -- gtk-launch …`), the way Omarchy's launcher does;
+- binds the resize keys to the layout, falling back to Hyprland's own resize elsewhere.
 
 ## Worth knowing
 
 - **Pinning is per app, not per window.** Pin a terminal to workspace 3 and every new
   window of that terminal opens there. Leave pin off for apps you open everywhere.
 - **Mouse-resizing a window snaps back.** On a blueprint workspace the blueprint owns the
-  proportions. Change them in the editor, or arrange by hand and capture again.
+  proportions. Use `SUPER + -` and `SUPER + =`, which the blueprint remembers, or arrange by
+  hand and capture again.
 - **`SUPER + L` still works.** It switches the current workspace to dwindle or scrolling
   until the next reload, then the blueprint takes over again.
 - **Capture and snapshot see tiled windows only.** Floating windows are left out, and windows that
@@ -128,6 +146,7 @@ tile-blueprints arrange    # just move running apps to their workspaces
 tile-blueprints windows 2  # windows on workspace 2 as JSON (what capture reads)
 tile-blueprints snapshot   # save the windows on this workspace as its blueprint
 tile-blueprints remove     # turn blueprints off (keeps your saved blueprints)
+tile-blueprints set-sizes 1 's:=0.4,0.6'   # store new proportions (what a resize calls)
 ```
 
 ## Menu entries

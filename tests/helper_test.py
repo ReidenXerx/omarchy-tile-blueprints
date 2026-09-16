@@ -78,6 +78,12 @@ hl = {
   window_rule = function(t) out[#out + 1] = "rule " .. hex(t.match.class) .. " " .. hex(t.workspace) end,
   on = function(event, fn) out[#out + 1] = "on " .. hex(event); fn() end,
   exec_cmd = function(cmd) out[#out + 1] = "exec " .. hex(cmd) end,
+  bind = function(keys, fn, opts) out[#out + 1] = "bind " .. hex(keys) end,
+  unbind = function(keys) out[#out + 1] = "unbind " .. hex(keys) end,
+  dispatch = function(d) out[#out + 1] = "dispatch" end,
+  dsp = { window = { resize = function(t) return t end } },
+  timer = function(fn, opts) fn() return {} end,
+  get_active_window = function() return nil end,
 }
 dofile(path)
 local function walk(key, node)
@@ -90,6 +96,52 @@ end
 for key, root in pairs(__omarchy_tiles.workspaces) do walk(key, root) end
 table.sort(out)
 io.write(table.concat(out, "\n"), "\n")
+"""
+
+
+LUA_RESIZE_HARNESS = r"""
+local path, classes, active, axis, delta = ...
+local registered, exec = nil, {}
+ACTIVE = nil
+hl = {
+  layout = { register = function(name, t) registered = t end },
+  workspace_rule = function() end,
+  window_rule = function() end,
+  on = function() end,
+  exec_cmd = function(cmd) exec[#exec + 1] = cmd end,
+  bind = function() end,
+  unbind = function() end,
+  dispatch = function() end,
+  dsp = { window = { resize = function(t) return t end } },
+  timer = function(fn) fn() return {} end,
+  get_active_window = function() return ACTIVE end,
+}
+dofile(path)
+
+local targets = {}
+for class in classes:gmatch("[^,]+") do
+  local window = { class = class, initial_class = class, workspace = { id = 1 } }
+  targets[#targets + 1] = {
+    window = window,
+    place = function(self, box) self.box = box end,
+  }
+end
+local ctx = {
+  targets = targets,
+  area = { x = 0, y = 0, w = 1000, h = 800 },
+  grid_cell = function(self, i, cols) return { x = 0, y = 0, w = 10, h = 10 } end,
+}
+
+registered.recalculate(ctx)
+ACTIVE = targets[tonumber(active)].window
+local moved = __omarchy_tiles.resize(axis, tonumber(delta))
+registered.recalculate(ctx)
+
+io.write("moved ", tostring(moved), "\n")
+for i, target in ipairs(targets) do
+  io.write("box ", i, " ", target.box.x, " ", target.box.y, " ", target.box.w, " ", target.box.h, "\n")
+end
+for _, cmd in ipairs(exec) do io.write("exec ", cmd, "\n") end
 """
 
 
@@ -110,6 +162,7 @@ class Sandbox(unittest.TestCase):
         shutil.copyfile(ROOT / "lua" / "tiles-engine.lua", engine)
         h.ENGINE = engine
         self.calls, self.notes, self.spawned = [], [], []
+        self.eval_ok = True
         self.clients, self.active = [], {"id": 1}
         h.hyprctl = self.fake_hyprctl
         h.notify = lambda summary, body="": self.notes.append((summary, body))
@@ -129,6 +182,8 @@ class Sandbox(unittest.TestCase):
             payload = json.dumps(self.active).encode()
         elif args == ["-j", "workspaces"]:
             payload = b"[]"
+        elif args and args[0] == "eval":
+            payload = b"ok\n" if self.eval_ok else b"error: no\n"
         return safe.Result(0, payload, b"", False, False)
 
     def write_config(self, value, raw=None):
@@ -301,12 +356,12 @@ class Lua(Sandbox):
         doc["workspaces"]["1"].update(pin=False, launch=False)
         text = self.h.generate(self.h.normalize_document(doc, strict=True)[0])
         self.assertNotIn("hl.window_rule", text)
-        self.assertNotIn("exec_cmd", text)
+        self.assertNotIn("gtk-launch", text)
 
     def test_no_launch_lines_without_trusted_tools(self):
         self.h.launch_tools = lambda: None
         doc = document(w1=leaf([{"class": "foot", "name": "Foot", "desktop": "foot"}]))
-        self.assertNotIn("exec_cmd", self.h.generate(self.h.normalize_document(doc, strict=True)[0]))
+        self.assertNotIn("gtk-launch", self.h.generate(self.h.normalize_document(doc, strict=True)[0]))
 
     def test_engine_read_is_capped_and_refuses_links(self):
         doc = self.h.normalize_document(document(w1=leaf(["a"])), strict=True)[0]
@@ -327,6 +382,196 @@ class Lua(Sandbox):
 
 
 # ------------------------------------------------------------------ config file, apply
+
+class Resize(Sandbox):
+    """Resizing on a blueprint workspace: the engine moves the border, the helper writes it
+    back, and the generated file is what routes the keys there."""
+
+    def split(self, sizes=None):
+        return {"dir": "h", "sizes": sizes or [0.5, 0.5],
+                "children": [leaf([{"class": "foot", "name": "Foot", "desktop": ""}]),
+                             leaf([{"class": "code", "name": "Code", "desktop": ""}])]}
+
+    def resize_run(self, doc, classes, active, axis, delta):
+        text = self.h.generate(self.h.normalize_document(doc, strict=True)[0])
+        path = self.dir / "generated.lua"
+        path.write_text(text)
+        harness = self.dir / "resize.lua"
+        harness.write_text(LUA_RESIZE_HARNESS)
+        r = self.lua("lua", str(harness), str(path), classes, str(active), axis, str(delta))
+        self.assertTrue(r.ok, r.stderr.decode())
+        return r.stdout.decode()
+
+    # ---- the engine
+
+    def test_windows_sharing_a_tile_move_their_own_border(self):
+        out = self.resize_run(document(w1=leaf([{"class": "foot", "name": "Foot", "desktop": ""},
+                                                {"class": "code", "name": "Code", "desktop": ""}])),
+                              "foot,code", 1, "x", -100)
+        self.assertIn("moved true", out)
+        widths = [int(line.split()[4]) for line in out.splitlines() if line.startswith("box")]
+        self.assertEqual(widths, [400, 600])
+        self.assertRegex(out, r"exec .*set-sizes 1 'w:=0\.4000,0\.6000'")
+
+    def test_a_tile_gives_ground_to_the_next_tile(self):
+        out = self.resize_run(document(w1=self.split()), "foot,code", 1, "x", -100)
+        self.assertIn("moved true", out)
+        widths = [int(line.split()[4]) for line in out.splitlines() if line.startswith("box")]
+        self.assertEqual(widths, [400, 600])
+        self.assertRegex(out, r"exec .*set-sizes 1 's:=0\.4000,0\.6000'")
+
+    def test_the_last_tile_pushes_the_border_the_other_way(self):
+        out = self.resize_run(document(w1=self.split()), "foot,code", 2, "x", -100)
+        widths = [int(line.split()[4]) for line in out.splitlines() if line.startswith("box")]
+        self.assertEqual(widths, [400, 600])
+
+    def test_an_axis_the_split_does_not_run_along_is_left_alone(self):
+        out = self.resize_run(document(w1=self.split()), "foot,code", 1, "y", -100)
+        self.assertIn("moved false", out)
+        self.assertNotIn("exec ", out)
+
+    def test_a_border_stops_at_the_floor_instead_of_passing_its_neighbour(self):
+        out = self.resize_run(document(w1=self.split()), "foot,code", 1, "x", -960)
+        self.assertIn("moved true", out)
+        widths = [int(line.split()[4]) for line in out.splitlines() if line.startswith("box")]
+        self.assertEqual(widths, [50, 950])
+
+    def test_one_window_alone_has_no_border_to_move(self):
+        out = self.resize_run(document(w1=self.split()), "foot", 1, "x", -100)
+        self.assertIn("moved false", out)
+
+    # ---- the generated file
+
+    def test_the_resize_keys_are_taken_over_in_both_spellings(self):
+        text = self.h.generate(self.h.normalize_document(document(w1=leaf(["foot"])), strict=True)[0])
+        self.assertEqual(text.count("hl.bind("), len(self.h.RESIZE_KEYS))
+        for mods, code, _axis, _delta, _description in self.h.RESIZE_KEYS:
+            name = self.h.KEY_NAMES[code]
+            self.assertIn(f'pcall(hl.unbind, "{mods}code:{code}")', text)
+            self.assertIn(f'pcall(hl.unbind, "{mods}{name}")', text)
+            self.assertIn(f'hl.bind("{mods}{name}", tile_resize(', text)
+
+    def test_the_only_program_the_generated_file_names_is_the_helper(self):
+        text = self.h.generate(self.h.normalize_document(document(w1=leaf(["foot"])), strict=True)[0])
+        execs = [line for line in text.splitlines() if "exec_cmd" in line]
+        self.assertEqual(execs, ['      hl.exec_cmd(command .. " set-sizes " .. key .. " \'" .. table.concat(parts, ";") .. "\'")'])
+        self.assertIn(f'__omarchy_tiles.persist = "{self.h.SELF}"', text)
+
+    # ---- applying without a full reload
+
+    def test_a_tile_change_goes_straight_to_hyprland(self):
+        self.write_config(document(w1=self.split()))
+        self.capture(self.h.cmd_apply, [])          # first apply writes the file the long way
+        self.calls.clear()
+        self.write_config(document(w1=self.split([0.2, 0.8])))
+        self.capture(self.h.cmd_apply, [])
+        commands = [c[0] for c in self.calls]
+        self.assertIn("eval", commands)
+        self.assertNotIn("reload", commands)
+        pushed = next(c for c in self.calls if c[0] == "eval")[1]
+        self.assertIn("__omarchy_tiles.workspaces = ", pushed)
+        self.assertIn('hl.dsp.layout("reload")', pushed)
+
+    def test_anything_but_tiles_still_reloads(self):
+        self.write_config(document(w1=self.split()))
+        self.capture(self.h.cmd_apply, [])
+        for change in (document(w1=self.split(), w2=leaf(["mpv"])),          # a new workspace
+                       {"version": 1, "workspaces": {"1": {"root": self.split(), "launch": True, "pin": False}}}):
+            self.calls.clear()
+            self.write_config(change)
+            self.capture(self.h.cmd_apply, [])
+            self.assertIn("reload", [c[0] for c in self.calls], change)
+
+    def test_hyprland_refusing_the_push_falls_back_to_a_reload(self):
+        self.write_config(document(w1=self.split()))
+        self.capture(self.h.cmd_apply, [])
+        self.calls.clear()
+        self.eval_ok = False
+        self.write_config(document(w1=self.split([0.2, 0.8])))
+        self.capture(self.h.cmd_apply, [])
+        self.assertIn("reload", [c[0] for c in self.calls])
+
+    def test_a_background_save_pushes_before_it_hands_off(self):
+        self.write_config(document(w1=self.split()))
+        self.capture(self.h.cmd_apply, [])
+        self.calls.clear()
+        doc = json.dumps(document(w1=self.split([0.2, 0.8])))
+        r, w = os.pipe()
+        os.write(w, (doc + "\n").encode())
+        os.close(w)
+        self.h.stdin_fd = lambda: r
+        self.capture(self.h.cmd_write, ["--background"])
+        os.close(r)
+        self.assertEqual([c[0] for c in self.calls], ["eval"])
+        self.assertEqual(self.spawned, [True])
+
+    def test_a_first_apply_reloads_because_there_is_nothing_to_compare(self):
+        self.write_config(document(w1=self.split()))
+        self.capture(self.h.cmd_apply, [])
+        self.assertIn("reload", [c[0] for c in self.calls])
+
+    def test_a_hostile_class_reaches_the_live_push_as_a_string(self):
+        self.write_config(document(w1=self.split()))
+        self.capture(self.h.cmd_apply, [])
+        self.calls.clear()
+        self.write_config(document(w1=leaf([{"class": 'a"]=os.exit()--', "name": "x", "desktop": ""}])))
+        self.capture(self.h.cmd_apply, [])
+        pushed = [c[1] for c in self.calls if c[0] == "eval"]
+        for text in pushed:
+            self.assertNotIn("os.exit()", text.replace('\\"', ""))
+
+    # ---- the helper
+
+    def test_set_sizes_stores_a_split_and_leaves_everything_else(self):
+        self.write_config(document(w1=self.split()))
+        self.assertEqual(self.capture(self.h.cmd_set_sizes, ["1", "s:=0.3,0.7"])[0], 0)
+        doc = json.loads(self.h.CONFIG.read_bytes())
+        self.assertEqual([round(v, 3) for v in doc["workspaces"]["1"]["root"]["sizes"]], [0.3, 0.7])
+        self.assertEqual(len(doc["workspaces"]["1"]["root"]["children"]), 2)
+
+    def test_set_sizes_stores_shares_inside_a_tile(self):
+        self.write_config(document(w1=leaf(["foot", "code"])))
+        self.assertEqual(self.capture(self.h.cmd_set_sizes, ["1", "w:=0.25,0.75"])[0], 0)
+        doc = json.loads(self.h.CONFIG.read_bytes())
+        self.assertEqual([round(v, 3) for v in doc["workspaces"]["1"]["root"]["shares"]], [0.25, 0.75])
+
+    def test_set_sizes_reaches_a_nested_split(self):
+        inner = self.split()
+        outer = {"dir": "v", "sizes": [0.5, 0.5], "children": [leaf(["mpv"]), inner]}
+        self.write_config(document(w1=outer))
+        self.assertEqual(self.capture(self.h.cmd_set_sizes, ["1", "s:2=0.2,0.8"])[0], 0)
+        doc = json.loads(self.h.CONFIG.read_bytes())
+        self.assertEqual([round(v, 3) for v in doc["workspaces"]["1"]["root"]["children"][1]["sizes"]], [0.2, 0.8])
+
+    def test_set_sizes_writes_the_layout_file_but_does_not_reload(self):
+        self.write_config(document(w1=self.split()))
+        self.capture(self.h.cmd_set_sizes, ["1", "s:=0.3,0.7"])
+        self.assertTrue(self.h.GENERATED.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_set_sizes_refuses_what_it_cannot_read(self):
+        self.write_config(document(w1=self.split()))
+        for args in (["1"], ["1", "s:=0.5,0.5", "extra"], ["0", "s:=0.5,0.5"], ["1", "nope"],
+                     ["1", "x:=0.5,0.5"], ["1", "s:=a,b"], ["1", "s:=" + "0.1," * 2000]):
+            self.assertEqual(self.capture(self.h.cmd_set_sizes, args)[0], 2, args)
+        self.assertEqual(json.loads(self.h.CONFIG.read_bytes())["workspaces"]["1"]["root"]["sizes"], [0.5, 0.5])
+
+    def test_set_sizes_shrugs_at_a_blueprint_that_moved_on(self):
+        self.write_config(document(w1=self.split()))
+        for args in (["2", "s:=0.3,0.7"], ["1", "s:9=0.3,0.7"], ["1", "s:=0.3,0.3,0.4"],
+                     ["1", "w:=0.3,0.7"], ["1", "s:1=0.3,0.7"]):
+            self.assertEqual(self.capture(self.h.cmd_set_sizes, args)[0], 0, args)
+        self.assertEqual(json.loads(self.h.CONFIG.read_bytes())["workspaces"]["1"]["root"]["sizes"], [0.5, 0.5])
+
+    def test_shares_for_a_different_number_of_windows_are_ignored(self):
+        doc = document(w1=leaf(["foot", "code"]))
+        doc["workspaces"]["1"]["root"]["shares"] = [0.2, 0.3, 0.5]
+        text = self.h.generate(self.h.normalize_document(doc, strict=True)[0])
+        self.assertIn("shares", text)
+        out = self.resize_run(doc, "foot,code", 1, "x", 0)
+        widths = [int(line.split()[4]) for line in out.splitlines() if line.startswith("box")]
+        self.assertEqual(widths, [500, 500])
+
 
 class Apply(Sandbox):
     def valid(self):

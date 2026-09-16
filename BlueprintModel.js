@@ -103,7 +103,14 @@ function normalize(node) {
 function normalizeNode(node) {
   if (!node || typeof node !== "object") return newLeaf(null)
   if (!Array.isArray(node.children)) {
-    return { id: node.id ? String(node.id) : null, apps: Array.isArray(node.apps) ? node.apps : [] }
+    var leaf = { id: node.id ? String(node.id) : null, apps: Array.isArray(node.apps) ? node.apps : [] }
+    // How windows sharing this tile split it, written by a resize on the workspace itself.
+    // The editor does not show them, but it must not throw them away on the next save.
+    if (Array.isArray(node.shares) && node.shares.length > 1
+        && node.shares.every(function(v) { return typeof v === "number" && isFinite(v) && v > 0 })) {
+      leaf.shares = node.shares.slice()
+    }
+    return leaf
   }
   var children = node.children.map(normalizeNode)
   if (children.length === 0) return newLeaf(null)

@@ -8,8 +8,18 @@
 --
 -- Schemas live in the global __omarchy_tiles.workspaces, keyed by workspace id, so they can
 -- be replaced live (`hyprctl eval`) without re-registering the layout.
+--
+-- Resizing: Hyprland 0.56 gives a Lua layout no resize hook at all (only recalculate,
+-- layout_msg and move_window), so the resize keys reach us as layout messages instead -
+-- "resize x -100". We move the border next to the focused tile, keep the new share in the
+-- live schema, and hand it to the plugin so the blueprint on disk follows along.
 
 __omarchy_tiles = __omarchy_tiles or { workspaces = {} }
+
+-- What the last recalculate produced: the box every node was given, and which children of
+-- a split actually took space. Resizing needs both, because a tile whose apps are absent
+-- collapses, and a collapsed neighbour must not be handed part of the drag.
+local live = { boxes = {}, present = {}, windows = {}, dir = {} }
 
 local function lower(s)
   return string.lower(tostring(s or ""))
@@ -81,25 +91,36 @@ local function occupied(node, assigned)
 end
 
 local function place_node(node, box, assigned)
+  live.boxes[node] = box
   if node.children then
-    local present, weights = {}, {}
+    local present, weights, indices = {}, {}, {}
     for i, child in ipairs(node.children) do
       if occupied(child, assigned) then
         present[#present + 1] = child
         weights[#weights + 1] = (node.sizes and node.sizes[i]) or 1
+        indices[#indices + 1] = i
       end
     end
+    live.present[node] = indices
     local boxes = divide(box, node.dir == "v" and "v" or "h", weights)
     for i, child in ipairs(present) do place_node(child, boxes[i], assigned) end
     return
   end
   local windows = assigned[node]
   if not windows or #windows == 0 then return end
-  -- Several windows in one tile: split it evenly along its longer side.
-  local weights = {}
-  for i = 1, #windows do weights[i] = 1 end
-  local boxes = divide(box, box.w >= box.h and "h" or "v", weights)
-  for i, target in ipairs(windows) do target:place(boxes[i]) end
+  -- Several windows in one tile: split it along its longer side, evenly unless the
+  -- blueprint carries shares for exactly this many windows (a resize inside the tile).
+  local dir = box.w >= box.h and "h" or "v"
+  local shares = type(node.shares) == "table" and #node.shares == #windows and node.shares
+  local weights, order = {}, {}
+  for i = 1, #windows do weights[i] = shares and (tonumber(shares[i]) or 1) or 1 end
+  local boxes = divide(box, dir, weights)
+  for i, target in ipairs(windows) do
+    target:place(boxes[i])
+    order[i] = target.window
+  end
+  live.windows[node] = order
+  live.dir[node] = dir
 end
 
 local function workspace_key(targets)
@@ -120,6 +141,7 @@ end
 local function recalculate(ctx)
   local targets = ctx.targets
   if #targets == 0 then return end
+  live.boxes, live.present, live.windows, live.dir = {}, {}, {}, {}
   local key = workspace_key(targets)
   local schema = key and __omarchy_tiles.workspaces[key]
   if not schema then return fallback_grid(ctx) end
@@ -146,13 +168,199 @@ local function recalculate(ctx)
   place_node(schema, ctx.area, assigned)
 end
 
+-- ── resizing ────────────────────────────────────────────────────────────────────────────
+
+-- A tile may not be dragged below this share of the split it sits in, so a border can
+-- never be pushed past its neighbour or off the screen.
+local MIN_SHARE = 0.05
+
+-- The chain of nodes from the schema root down to target, with the child index taken at
+-- each step, or nil when target is not in this schema.
+local function find_path(node, target, nodes, indices)
+  nodes[#nodes + 1] = node
+  if node == target then return nodes, indices end
+  if node.children then
+    for i, child in ipairs(node.children) do
+      indices[#indices + 1] = i
+      if find_path(child, target, nodes, indices) then return nodes, indices end
+      indices[#indices] = nil
+    end
+  end
+  nodes[#nodes] = nil
+  return nil
+end
+
+local function position_in(list, value)
+  for i, item in ipairs(list) do
+    if item == value then return i end
+  end
+end
+
+-- The tile a window is laid out in: the first leaf that lists its class, or the largest
+-- one, which is where recalculate sends anything unlisted.
+local function leaf_of(schema, window)
+  local leaves = collect_leaves(schema, {})
+  for _, leaf in ipairs(leaves) do
+    if leaf_wants(leaf, window) then return leaf end
+  end
+  return largest_leaf(schema, 1) or leaves[1]
+end
+
+local function active_schema()
+  if not (hl and hl.get_active_window) then return nil end
+  local ok, window = pcall(hl.get_active_window)
+  if not ok or not window then return nil end
+  local key = select(2, pcall(function() return tostring(window.workspace.id) end))
+  if type(key) ~= "string" then return nil end
+  return __omarchy_tiles.workspaces[key], key, window
+end
+
+-- Changed splits waiting to be written to the blueprint, keyed by workspace then by the
+-- dotted child path of the split. Keystrokes repeat, so the write is debounced.
+local pending, save_timer = {}, nil
+
+local function flush_saves()
+  save_timer = nil
+  local command = __omarchy_tiles.persist
+  for key, splits in pairs(pending) do
+    local parts = {}
+    for where, sizes in pairs(splits) do
+      local numbers = {}
+      for i, size in ipairs(sizes) do numbers[i] = string.format("%.4f", size) end
+      parts[#parts + 1] = where .. "=" .. table.concat(numbers, ",")
+    end
+    if command and #parts > 0 then
+      hl.exec_cmd(command .. " set-sizes " .. key .. " '" .. table.concat(parts, ";") .. "'")
+    end
+  end
+  pending = {}
+end
+
+local function remember(key, kind, path, values)
+  local copy = {}
+  for i, value in ipairs(values) do copy[i] = value end
+  pending[key] = pending[key] or {}
+  pending[key][kind .. ":" .. path] = copy
+  if not save_timer and hl.timer then
+    save_timer = hl.timer(flush_saves, { type = "oneshot", timeout = 400 })
+  end
+end
+
+-- Move a border by delta pixels, taking from one side and giving to the other. Returns
+-- the two new shares, or nil when the move would push a tile under the floor.
+local function shift_border(values, mine, other, sign, delta, span)
+  local total = 0
+  for _, value in ipairs(values) do total = total + value end
+  if span <= 0 or total <= 0 then return nil end
+  local shift = delta / span * total * sign
+  local a, b = values[mine] + shift, values[other] - shift
+  local floor = MIN_SHARE * total
+  if a < floor then b, a = b - (floor - a), floor end
+  if b < floor then a, b = a - (floor - b), floor end
+  if a < floor or b < floor then return nil end
+  return a, b
+end
+
+-- Where the active window sits among the windows sharing its tile.
+local function window_slot(leaf, window)
+  local order = live.windows[leaf]
+  if not order then return nil end
+  for i, other in ipairs(order) do
+    if other == window then return i, #order end
+  end
+  return nil
+end
+
+-- Move the border beside the focused window by delta pixels: negative is left or up,
+-- positive right or down, which is how Hyprland's own resize bindings read. The border is
+-- the one the window shares with the next neighbour, or with the previous one when it is
+-- last, so a middle tile always gives ground on its right or bottom edge.
+local function resize(axis, delta)
+  delta = tonumber(delta) or 0
+  local schema, key, window = active_schema()
+  if not schema or delta == 0 then return false end
+  local leaf = leaf_of(schema, window)
+  local nodes, indices = nil, nil
+  if leaf then nodes, indices = find_path(schema, leaf, {}, {}) end
+  if not nodes then return false end
+
+  local want = (axis == "y") and "v" or "h"
+
+  -- Windows sharing one tile: the border between them lives in the tile's own shares.
+  local slot, count = window_slot(leaf, window)
+  if slot and count > 1 and live.dir[leaf] == want then
+    local box = live.boxes[leaf]
+    local shares = {}
+    for i = 1, count do
+      shares[i] = (type(leaf.shares) == "table" and tonumber(leaf.shares[i])) or 1 / count
+    end
+    local mine, other, sign
+    if slot < count then mine, other, sign = slot, slot + 1, 1 else mine, other, sign = slot, slot - 1, -1 end
+    local span = box and ((want == "h") and box.w or box.h) or 0
+    local a, b = shift_border(shares, mine, other, sign, delta, span)
+    if a then
+      shares[mine], shares[other] = a, b
+      leaf.shares = shares
+      remember(key, "w", table.concat(indices, "."), shares)
+      return true
+    end
+    return false
+  end
+
+  for depth = #nodes - 1, 1, -1 do
+    local node = nodes[depth]
+    local present = live.present[node]
+    local box = live.boxes[node]
+    local dir = (node.dir == "v") and "v" or "h"
+    if dir == want and present and #present > 1 and box then
+      local slot = position_in(present, indices[depth])
+      if slot then
+        -- The border on the side the tile actually shares with a neighbour: the one after
+        -- it when there is one, so a middle tile gives ground on its right/bottom edge.
+        local mine, other, sign
+        if present[slot + 1] then
+          mine, other, sign = indices[depth], present[slot + 1], 1
+        else
+          mine, other, sign = indices[depth], present[slot - 1], -1
+        end
+        local span = (dir == "h") and box.w or box.h
+        local sizes = {}
+        for i = 1, #node.children do sizes[i] = node.sizes[i] or 1 end
+        -- Only the children that took space may trade: a collapsed tile has no border.
+        local visible = {}
+        for _, i in ipairs(present) do visible[#visible + 1] = sizes[i] end
+        local a, b = shift_border(sizes, mine, other, sign, delta,
+          span * (function()
+            local all, shown = 0, 0
+            for _, value in ipairs(sizes) do all = all + value end
+            for _, value in ipairs(visible) do shown = shown + value end
+            return shown > 0 and all / shown or 1
+          end)())
+        if a then
+          sizes[mine], sizes[other] = a, b
+          node.sizes = sizes
+          remember(key, "s", table.concat(indices, ".", 1, depth - 1), sizes)
+          return true
+        end
+      end
+    end
+  end
+  return false
+end
+
+__omarchy_tiles.resize = resize
+
 return {
   recalculate = recalculate,
   layout_msg = function(ctx, msg)
-    local command = tostring(msg or ""):match("^(%S+)")
-    if command == "reload" then
+    local text = tostring(msg or "")
+    local command, axis, delta = text:match("^(%S+)%s+(%S+)%s+(-?%d+)$")
+    if command == "resize" then
+      return resize(axis, delta) and true or "tiles: nothing to resize here"
+    end
+    if text:match("^(%S+)") == "reload" then
       return true
     end
-    return "tiles: expected reload"
+    return "tiles: expected reload or resize"
   end,
 }
