@@ -59,6 +59,7 @@ The editor opens on the workspace you are on, drawn in your screen's proportions
 | `C` | **capture**: build the blueprint from the windows on this workspace |
 | `P` | pin: the apps always open on this workspace |
 | `O` | open these apps at login |
+| `M` | the display this workspace opens on: any display, then each connected one |
 | `1`–`9`, `0` | edit another workspace |
 | `Ctrl` + `S` | save and apply |
 | `Ctrl` + `Del` | clear this workspace's blueprint |
@@ -76,6 +77,8 @@ Arrange a workspace by hand, snapshot it, and it comes back:
 - **windows that share a tile**, in the proportion you left them;
 - **floating windows** - where they sit, how big they are, and whether they were pinned;
 - **fullscreen and full width** - an app you left fullscreen opens fullscreen.
+- **the display**, when the workspace already had one. A brand new snapshot records the layout
+  only, so nothing starts opening on another screen until you choose it in the editor.
 
 Floating windows and fullscreen come back as Hyprland window rules, so they apply to the
 app, the way pinning already does.
@@ -111,6 +114,20 @@ or at login until you turn that on in the editor.
 - **Unlisted windows share the largest tile.** Several windows in one tile split it evenly
   along its longer side, until you resize one.
 - **Workspaces without a blueprint are untouched** and keep whatever layout they had.
+- **A class is matched without regard to case.** A card added from the installed-app list can
+  carry the desktop id (`spotify`) while the window calls itself `Spotify`, and the window
+  rule still catches it.
+
+## Which display a workspace opens on
+
+`M` in the editor cycles where the workspace lives: **any display**, then each connected one,
+then back. The choice is written as a workspace rule, so a display you leave unset keeps being
+placed the way Hyprland always did, and a display you pick is named by its stable `desc:`
+description, which survives the cables being replugged the other way round.
+
+A blueprint workspace is also made **persistent**: it exists on its display even while it is
+empty, which is what a layout drawn for that display expects. Workspaces without a blueprint
+are not touched.
 
 ## Resize on the workspace, not in the editor
 
@@ -148,7 +165,8 @@ edited**. The generated file:
 - sets that layout on each workspace that has a blueprint;
 - with **pin** on, adds a window rule per app so it opens on its workspace;
 - with **open at login** on, starts each app through its desktop entry
-  (`uwsm-app -- gtk-launch …`), the way Omarchy's launcher does;
+  (`uwsm-app -- gtk-launch …`), the way Omarchy's launcher does — or all at once, without
+  waiting for the next login, with `tile-blueprints launch`;
 - binds the resize keys to the layout, falling back to Hyprland's own resize elsewhere.
 
 ## Worth knowing
@@ -169,7 +187,9 @@ edited**. The generated file:
 tile-blueprints status     # what is configured, and what Hyprland is using
 tile-blueprints apply      # regenerate, reload, arrange
 tile-blueprints arrange    # just move running apps to their workspaces
+tile-blueprints launch     # start the apps that open at login, now
 tile-blueprints windows 2  # workspace 2 as JSON: {"tiled": [...], "floating": [...]}
+tile-blueprints monitors   # the displays a workspace can be pinned to, as JSON
 tile-blueprints snapshot   # save the windows on this workspace as its blueprint
 tile-blueprints remove     # turn blueprints off (keeps your saved blueprints)
 tile-blueprints set-sizes 1 's:=0.4,0.6'   # store new proportions (what a resize calls)

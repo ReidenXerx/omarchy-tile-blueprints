@@ -939,7 +939,7 @@ BorderSurface {
           width: parent.width
           textFormat: Text.PlainText
           elide: Text.ElideRight
-          text: "Drag apps between tiles · | split beside · - split below · X remove · Shift+arrows resize · A add · C capture"
+          text: "Drag apps between tiles · | split beside · - split below · X remove · Shift+arrows resize · A add · C capture · M display"
           color: tb.foreground
           opacity: 0.5
           font.family: tb.fontFamily
@@ -958,13 +958,17 @@ BorderSurface {
           model: [
             { flag: "pin", label: "P  pin to workspace" },
             { flag: "launch", label: "O  open at login" },
+            { flag: "monitor", label: "M  display" },
             { flag: "save", label: "Ctrl+S  save" }
           ]
 
           delegate: Rectangle {
             id: flagChip
             required property var modelData
-            readonly property bool on: modelData.flag === "save" ? tb.hasChanges : tb.current[modelData.flag] !== false
+            readonly property bool isMonitor: modelData.flag === "monitor"
+            readonly property bool on: modelData.flag === "save" ? tb.hasChanges
+              : isMonitor ? tb.current.monitor !== undefined && tb.current.monitor !== ""
+              : tb.current[modelData.flag] !== false
             width: flagText.implicitWidth + Style.spacing.lg * 2
             height: Style.space(28)
             radius: height / 2
@@ -976,7 +980,7 @@ BorderSurface {
               id: flagText
               anchors.centerIn: parent
               textFormat: Text.PlainText
-              text: flagChip.modelData.label
+              text: flagChip.isMonitor ? "M  " + tb.monitorLabel : flagChip.modelData.label
               color: flagChip.on ? tb.foreground : Util.alpha(tb.foreground, 0.5)
               font.family: tb.fontFamily
               font.pixelSize: Style.font.caption
@@ -985,7 +989,12 @@ BorderSurface {
             MouseArea {
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
-              onClicked: { if (flagChip.modelData.flag === "save") tb.save(); else tb.toggleFlag(flagChip.modelData.flag); keys.forceActiveFocus() }
+              onClicked: {
+                if (flagChip.modelData.flag === "save") tb.save()
+                else if (flagChip.isMonitor) tb.cycleMonitor()
+                else tb.toggleFlag(flagChip.modelData.flag)
+                keys.forceActiveFocus()
+              }
             }
           }
         }

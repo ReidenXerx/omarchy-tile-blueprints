@@ -8,7 +8,9 @@
                                        to a bounded detached helper and returns at once
   tile-blueprints apply                regenerate the Hyprland layout file, reload, arrange
   tile-blueprints arrange              move running apps to the workspaces they are pinned to
+  tile-blueprints launch               start the apps that open at login, now
   tile-blueprints windows <ws>         tiled windows on a workspace, as JSON (for capture)
+  tile-blueprints monitors            connected displays the editor can pin a workspace to, JSON
   tile-blueprints snapshot [<ws>]      save the windows on a workspace (default: the focused one)
                                        as its blueprint, then apply
   tile-blueprints apps                 apps to assign: running windows and installed apps, JSON
@@ -96,6 +98,7 @@ MAX_APPS_OUT = 3000
 MAX_WINDOWS = 256
 OUTPUT_MAX = 2 * 1024 * 1024      # bytes of JSON a listing prints
 MAX_WORKSPACES = 10
+MAX_MONITORS = 16                 # displays the editor is willing to list
 MAX_WORKSPACE_ID = 99
 MAX_TILES = 64                    # per workspace
 MAX_WINDOW_SHARES = 16            # windows whose split inside one tile is remembered
@@ -108,6 +111,7 @@ MAX_TEXT = 256                    # class and name length
 MAX_PROBLEMS = 20
 MAX_COORDINATE = 1_000_000
 HYPR_TIMEOUT = 5.0
+LAUNCH_TIMEOUT = 120.0           # an app may take its time registering before uwsm-app returns
 HYPR_OUTPUT_MAX = 4 * 1024 * 1024
 RELOAD_TIMEOUT = 15.0
 ARRANGE_BUDGET = 20.0             # seconds for all the moves of one arrange
@@ -115,6 +119,10 @@ APPLY_DEADLINE = 90               # hard deadline of the detached apply after `w
 JSON_LIMITS = {"max_depth": 48, "max_items": 100000, "max_string": 4096}
 
 WORKSPACE_KEY = re.compile(r"[1-9][0-9]?")
+# What a workspace rule may name as its display: Hyprland takes an output name, an id, or a
+# stable desc: description. Anything printable will do, since the value reaches the Lua file
+# as an escaped literal; the cap bounds it.
+MONITOR_RULE = re.compile(r"[ -~]{1,256}")
 DESKTOP_ID = re.compile(r"[A-Za-z0-9._+-]{1,255}")
 LEAF_ID = re.compile(r"[A-Za-z0-9_-]{1,32}")
 ADDRESS = re.compile(r"0x[0-9a-fA-F]{1,16}")
@@ -352,6 +360,10 @@ def normalize_workspace(ws):
     root = _normalize_tree(ws["root"], state, 0)
     _assign_ids(state["leaves"])
     out = {"root": root, "launch": ws.get("launch") is not False, "pin": ws.get("pin") is not False}
+    monitor = ws.get("monitor").strip() if isinstance(ws.get("monitor"), str) else ""
+    # A leftover blank means "any display", the same as no value at all.
+    if MONITOR_RULE.fullmatch(monitor):
+        out["monitor"] = monitor
     floating = normalize_floating(ws.get("floating"), state)
     if floating:
         out["floating"] = floating
@@ -468,7 +480,10 @@ def engine_tree(node):
 
 
 def class_regex(cls):
-    return "^" + re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", cls) + "$"
+    """A window rule matches this app by class. Case-insensitively, like the layout engine
+    does: a card added from the installed-app list can carry the desktop id ("spotify") while
+    the window calls itself something else ("Spotify"), and the rule has to still catch it."""
+    return "(?i)^" + re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", cls) + "$"
 
 
 def read_engine():
@@ -484,6 +499,29 @@ def launch_tools():
         return safe.tool("uwsm-app"), safe.tool("gtk-launch")
     except safe.UnsafeError:
         return None
+
+
+def spawn(argv, timeout=10.0):
+    """Start a program and walk away. Every launch goes through here, so a test can see it."""
+    return safe.spawn(argv, timeout=timeout)
+
+
+def login_launches(doc):
+    """The desktop ids that open at login, in workspace order: what the generated file starts
+    and what `launch` starts now. An app whose desktop id gtk-launch could not take is left
+    out (a web app often has none), the same way the generated file leaves it out."""
+    out = []
+    for _key, ws in workspaces(doc):
+        if not ws["launch"]:
+            continue
+        for app in apps_of(ws["root"]):
+            if valid_class(app["class"]) and valid_desktop(app["desktop"]) and app["desktop"] not in out:
+                out.append(app["desktop"])
+        for window in ws.get("floating", []):
+            desktop = window.get("desktop", "")
+            if valid_desktop(desktop) and desktop not in out:
+                out.append(desktop)
+    return out
 
 
 # Omarchy binds window resizing to SUPER and the -/= keys, in four step sizes. Those
@@ -620,9 +658,16 @@ def generate(doc):
         "",
     ]
     lines += resize_bindings()
-    launches = []
     for key, ws in pairs:
-        lines.append(f'hl.workspace_rule({{ workspace = {lua_str(key)}, layout = {lua_str("lua:" + LAYOUT_NAME)} }})')
+        rule = [f"workspace = {lua_str(key)}", f"layout = {lua_str('lua:' + LAYOUT_NAME)}"]
+        if ws.get("monitor"):
+            # The blueprint owns the workspace, so it also owns where it lives: a stable
+            # desc: description survives a port being replugged the other way round.
+            rule.append(f"monitor = {lua_str(ws['monitor'])}")
+        # Persistent so the workspace exists on its display even while empty, which is what a
+        # blueprint drawn for that display expects.
+        rule.append("persistent = true")
+        lines.append("hl.workspace_rule({ " + ", ".join(rule) + " })")
         for app in apps_of(ws["root"]):
             if not valid_class(app["class"]):
                 continue
@@ -631,9 +676,6 @@ def generate(doc):
                              f'workspace = {lua_str(key + " silent")} }})')
             if app.get("state"):
                 lines.append(state_rule(app["class"], app["state"]))
-            desktop = app["desktop"]
-            if ws["launch"] and valid_desktop(desktop) and desktop not in launches:
-                launches.append(desktop)
         # Floating windows are not part of the tiling, so they come back as rules: float
         # where they were, the size they were, pinned if they were pinned.
         for window in ws.get("floating", []):
@@ -647,9 +689,7 @@ def generate(doc):
             lines.append("hl.window_rule({ " + ", ".join(parts) + " })")
             if window.get("state"):
                 lines.append(state_rule(window["class"], window["state"]))
-            desktop = window.get("desktop", "")
-            if ws["launch"] and valid_desktop(desktop) and desktop not in launches:
-                launches.append(desktop)
+    launches = login_launches(doc)
     tools = launch_tools() if launches else None
     if tools:
         uwsm_app, gtk_launch = tools
@@ -831,6 +871,40 @@ def arrange(doc, budget=ARRANGE_BUDGET):
         if r is not None and r.ok:
             moved += 1
     return moved
+
+
+def cmd_launch(args):
+    """Start the apps that open at login, now, instead of waiting for Hyprland to restart.
+    Exactly what the generated file runs on hyprland.start, in the same order."""
+    if args:
+        return fail("launch takes no arguments", 2)
+    try:
+        doc, _ = load_config()
+    except Unreadable as e:
+        notify("Nothing was launched", str(e))
+        return fail(str(e))
+    desktops = login_launches(doc)
+    if not desktops:
+        notify("Nothing to launch", "No workspace opens its apps at login.")
+        return fail("no workspace opens its apps at login")
+    tools = launch_tools()
+    if not tools:
+        return fail("uwsm-app and gtk-launch were not found in /usr/bin")
+    uwsm_app, gtk_launch = tools
+    started = 0
+    for desktop in desktops:
+        try:
+            spawn([uwsm_app, "--", gtk_launch, desktop + ".desktop"], timeout=LAUNCH_TIMEOUT)
+        except (safe.UnsafeError, OSError) as e:
+            print(f"skipped {clean_text(desktop, 200)}: {e}", file=sys.stderr)
+            continue
+        started += 1
+    if started == 0:
+        return fail("could not start any of the apps")
+    notify("Tile blueprints launching",
+           f"{started} app{'s' if started != 1 else ''} opening in their tiles.")
+    print(f"Launched {started} app(s).")
+    return 0
 
 
 def cmd_arrange(_args):
@@ -1096,6 +1170,38 @@ def tiled_windows(ws):
     return workspace_windows(ws)["tiled"]
 
 
+def cmd_monitors(args):
+    """The displays a workspace can be pinned to. `rule` is what the workspace rule takes:
+    the stable desc: description when Hyprland knows one, the output name otherwise."""
+    if args:
+        return fail("monitors takes no arguments", 2)
+    data = hypr_json("monitors")
+    if not isinstance(data, list):
+        return fail("could not read the displays from Hyprland")
+    out = []
+    for item in data[:MAX_MONITORS]:
+        if not isinstance(item, dict):
+            continue
+        name = clean_text(item.get("name"), 64)
+        if not name:
+            continue
+        description = clean_text(item.get("description"), 256)
+        rule = "desc:" + description if description else name
+        # A description Hyprland could not take as a rule value falls back to the name.
+        if not MONITOR_RULE.fullmatch(rule):
+            rule = name if MONITOR_RULE.fullmatch(name) else ""
+        if not rule:
+            continue
+        active = item.get("activeWorkspace")
+        monitor = {"name": name, "description": description, "rule": rule,
+                   "width": _coordinate(item.get("width"), 1, MAX_COORDINATE) or 0,
+                   "height": _coordinate(item.get("height"), 1, MAX_COORDINATE) or 0,
+                   "workspace": active.get("id") if isinstance(active, dict) else 0}
+        out.append(monitor)
+    print(json.dumps(out, ensure_ascii=False, allow_nan=False))
+    return 0
+
+
 def cmd_windows(args):
     if len(args) != 1 or not WORKSPACE_KEY.fullmatch(args[0]):
         return fail(f"windows needs a workspace number (1-{MAX_WORKSPACE_ID})", 2)
@@ -1228,10 +1334,14 @@ def cmd_snapshot(args):
             recorded = next((w.get("state") for w in windows if w["class"] == app["class"] and w.get("state")), "")
             if recorded:
                 app["state"] = recorded
-    candidate[key] = {"root": tree,
-                      "pin": previous["pin"] if previous else False,
-                      "launch": previous["launch"] if previous else False,
-                      "floating": state["floating"]}
+    record = {"root": tree,
+              "pin": previous["pin"] if previous else False,
+              "launch": previous["launch"] if previous else False,
+              "floating": state["floating"]}
+    # A snapshot records the layout; a display already chosen for this workspace stays.
+    if previous and previous.get("monitor"):
+        record["monitor"] = previous["monitor"]
+    candidate[key] = record
     try:
         saved, _ = normalize_document({"version": 1, "workspaces": candidate}, strict=True)
         blob = serialize_config(saved)
@@ -1377,8 +1487,10 @@ def cmd_set_sizes(args):
 
 COMMANDS = {
     "open": cmd_open, "config": cmd_config, "write": cmd_write, "apply": cmd_apply, "arrange": cmd_arrange,
+    "launch": cmd_launch,
     "set-sizes": cmd_set_sizes,
-    "windows": cmd_windows, "snapshot": cmd_snapshot, "apps": cmd_apps, "active-workspace": cmd_active_workspace,
+    "windows": cmd_windows, "monitors": cmd_monitors,
+    "snapshot": cmd_snapshot, "apps": cmd_apps, "active-workspace": cmd_active_workspace,
     "status": cmd_status, "remove": cmd_remove,
 }
 

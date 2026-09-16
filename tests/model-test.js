@@ -9,7 +9,7 @@ const assert = require("assert")
 const root = path.resolve(__dirname, "..")
 const source = fs.readFileSync(path.join(root, "BlueprintModel.js"), "utf8").replace(/^\.pragma library\s*$/m, "")
 const ctx = {}
-vm.runInNewContext(source + "\nthis.M = { MIN_SIZE, clone, isLeaf, newLeaf, leaves, nextId, pathTo, nodeAt, findLeaf, normalize, split, remove, grow, moveDivider, assign, unassign, order, layout, neighbour, capture, defaultWorkspace, normalizeFile, appCount, isMeaningful, tileLabel, drop, dropLabel, stableJson, changedWorkspaces, listNumbers, nextState, stateLabel, withState, normalizeFloating }", ctx)
+vm.runInNewContext(source + "\nthis.M = { MIN_SIZE, clone, isLeaf, newLeaf, leaves, nextId, pathTo, nodeAt, findLeaf, normalize, split, remove, grow, moveDivider, assign, unassign, order, layout, neighbour, capture, defaultWorkspace, normalizeFile, appCount, isMeaningful, tileLabel, drop, dropLabel, stableJson, changedWorkspaces, listNumbers, nextState, stateLabel, withState, normalizeFloating, normalizeMonitor, monitorLabel, nextMonitor }", ctx)
 const M = ctx.M
 
 // vm-context objects carry that context's prototypes; compare plain copies.
@@ -339,6 +339,51 @@ test("reading the file keeps floating windows and drops nonsense", () => {
   ])
   assert.strictEqual(M.normalizeFile({ workspaces: { "2": { root: { id: "t1", apps: [] } } } })
     .workspaces["2"].floating, undefined)
+})
+
+test("a display is kept only when it is a usable rule value", () => {
+  const kept = M.normalizeFile({ workspaces: { "3": { root: M.newLeaf("t1"), monitor: "desc:Dell Inc. DELL X Y" } } })
+  assert.strictEqual(kept.workspaces["3"].monitor, "desc:Dell Inc. DELL X Y")
+  for (const bad of ["", "   ", "a\nb", 7, null, ["DP-1"], "x".repeat(257)]) {
+    const file = M.normalizeFile({ workspaces: { "3": { root: M.newLeaf("t1"), monitor: bad } } })
+    assert.strictEqual("monitor" in file.workspaces["3"], false, JSON.stringify(bad))
+  }
+})
+
+test("choosing another display counts as an unsaved change", () => {
+  const withApp = monitor => ({ workspaces: { "1": {
+    root: { id: "t1", apps: [{ class: "code", name: "code", desktop: "" }] }, monitor } } })
+  const saved = M.normalizeFile(withApp("DP-1"))
+  const draft = M.clone(saved)
+  eq(M.changedWorkspaces(saved, draft), [], "same display and layout")
+  draft.workspaces["1"].monitor = "DP-2"
+  eq(M.changedWorkspaces(saved, draft), [1], "another display")
+  delete draft.workspaces["1"].monitor
+  eq(M.changedWorkspaces(saved, draft), [1], "back to any display")
+})
+
+test("the display chip cycles any display and each connected one", () => {
+  const list = [{ name: "DP-1", rule: "desc:A" }, { name: "DP-2", rule: "DP-2" }]
+  assert.strictEqual(M.nextMonitor("", list), "desc:A")
+  assert.strictEqual(M.nextMonitor("desc:A", list), "DP-2")
+  assert.strictEqual(M.nextMonitor("DP-2", list), "")
+  assert.strictEqual(M.nextMonitor("unplugged", list), "")
+  assert.strictEqual(M.nextMonitor("", []), "")
+  assert.strictEqual(M.monitorLabel("", list), "any display")
+  assert.strictEqual(M.monitorLabel("desc:A", list), "DP-1")
+  assert.strictEqual(M.monitorLabel("unplugged", list), "unplugged")
+})
+
+test("the display chip walks every connected display, however many there are", () => {
+  const list = [1, 2, 3, 4, 5].map(n => ({ name: "DP-" + n, rule: "desc:Panel " + n }))
+  let at = ""
+  const seen = []
+  for (let i = 0; i <= list.length; i++) { at = M.nextMonitor(at, list); seen.push(at) }
+  eq(seen, ["desc:Panel 1", "desc:Panel 2", "desc:Panel 3", "desc:Panel 4", "desc:Panel 5", ""],
+     "any display, each screen in turn, then back to any display")
+  eq(M.monitorLabel("desc:Panel 4", list), "DP-4", "the fourth display's own name")
+  const one = [{ name: "eDP-1", rule: "eDP-1" }]
+  eq([M.nextMonitor("", one), M.nextMonitor("eDP-1", one)], ["eDP-1", ""], "a single display still cycles")
 })
 
 console.log(`${passed} passed, ${failures.length} failed`)
