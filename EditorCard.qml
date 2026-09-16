@@ -177,7 +177,8 @@ BorderSurface {
     Item {
       id: stage
       width: parent.width
-      height: content.height - Style.space(34) - footer.height - content.spacing * 2
+      height: content.height - Style.space(34) - floatingStrip.height - footer.height
+              - content.spacing * (floatingStrip.height > 0 ? 3 : 2)
 
       readonly property real pickerWidth: tb.pickerOpen ? Style.space(300) : 0
       readonly property real aspect: editorCard.screenWidth > 0 && editorCard.screenHeight > 0 ? editorCard.screenWidth / editorCard.screenHeight : 16 / 10
@@ -277,6 +278,7 @@ BorderSurface {
                     required property int index
                     readonly property string appClass: String(modelData)
                     readonly property var app: tile.appByClass[appClass.toLowerCase()] || ({ "class": appClass, name: appClass, desktop: "" })
+                    readonly property string openState: String((tile.appByClass[appClass.toLowerCase()] || {}).state || "")
                     readonly property bool isDragged: !!tb.dragApp && tb.dragFrom === tile.tileId
                       && String(tb.dragApp["class"]).toLowerCase() === appClass.toLowerCase()
                     readonly property bool isSwapTarget: !!tb.dropTarget && tb.dropKind === "swap" && tb.dropTarget.tile === tile.tileId
@@ -417,6 +419,41 @@ BorderSurface {
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
                         onClicked: tb.removeApp(tile.tileId, card.app["class"])
+                      }
+                    }
+
+                    // How the app opens: nothing, full screen, or full width. Set by a
+                    // snapshot of the real workspace, and walked by clicking.
+                    Rectangle {
+                      id: stateBadge
+                      visible: card.openState !== "" || cardHover.hovered || tile.isSelected
+                      anchors.left: parent.left
+                      anchors.bottom: parent.bottom
+                      anchors.margins: Style.spacing.sm
+                      height: Style.space(18)
+                      width: stateText.implicitWidth + Style.spacing.md * 2
+                      radius: height / 2
+                      color: card.openState !== "" ? Util.alpha(tb.accent, stateArea.containsMouse ? 0.45 : 0.28)
+                                               : Util.alpha(tb.foreground, stateArea.containsMouse ? 0.22 : 0.1)
+
+                      Text {
+                        id: stateText
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: card.openState === "fullscreen" ? "full screen"
+                          : card.openState === "maximized" ? "full width" : "opens normally"
+                        color: card.openState !== "" ? tb.accent : tb.foreground
+                        opacity: card.openState !== "" ? 1 : 0.55
+                        font.family: tb.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      MouseArea {
+                        id: stateArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: tb.cycleState(tile.tileId, card.app)
                       }
                     }
                   }
@@ -762,6 +799,102 @@ BorderSurface {
                   tb.cancelDrag()
                 }
                 onClicked: if (!dragged) tb.assignApp(appRow.modelData)
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ------------------------------------------------ floating windows
+    //
+    // Windows a snapshot found floating on this workspace. They sit outside the tiling, so
+    // there is nothing to arrange here: the strip says what will be put back, and lets a
+    // window be dropped from the blueprint.
+    Item {
+      id: floatingStrip
+      width: parent.width
+      height: tb.floatingWindows().length > 0 ? Style.space(34) : 0
+      visible: height > 0
+
+      Text {
+        id: floatingLabel
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        textFormat: Text.PlainText
+        text: "Floating:"
+        color: tb.foreground
+        opacity: 0.5
+        font.family: tb.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      Row {
+        anchors.left: floatingLabel.right
+        anchors.leftMargin: Style.spacing.md
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: Style.spacing.md
+
+        Repeater {
+          model: tb.floatingWindows()
+
+          delegate: Rectangle {
+            id: chip
+            required property var modelData
+            required property int index
+            height: Style.space(26)
+            width: chipRow.implicitWidth + Style.spacing.md * 2
+            radius: tb.cornerRadius
+            color: chipHover.hovered ? Util.alpha(tb.foreground, 0.16) : Util.alpha(tb.foreground, 0.08)
+
+            HoverHandler { id: chipHover }
+
+            Row {
+              id: chipRow
+              anchors.centerIn: parent
+              spacing: Style.spacing.sm
+
+              Image {
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(16)
+                height: width
+                sourceSize.width: width * 2
+                sourceSize.height: height * 2
+                source: tb.iconFor(chip.modelData)
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
+                smooth: true
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: (chip.modelData.name || chip.modelData["class"])
+                  + "  " + Math.round(chip.modelData.w) + "×" + Math.round(chip.modelData.h)
+                  + (chip.modelData.pinned ? "  pinned" : "")
+                  + (chip.modelData.state ? "  " + Model.stateLabel(String(chip.modelData.state)) : "")
+                color: tb.foreground
+                opacity: 0.8
+                font.family: tb.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: chipHover.hovered
+                textFormat: Text.PlainText
+                text: "×"
+                color: tb.accent
+                font.family: tb.fontFamily
+                font.pixelSize: Style.font.body
+
+                MouseArea {
+                  anchors.fill: parent
+                  anchors.margins: -Style.spacing.xs
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: tb.removeFloating(chip.index)
+                }
               }
             }
           }

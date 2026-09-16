@@ -397,6 +397,34 @@ Item {
     root.focusKeys()
   }
 
+  // How an app opens on this workspace: normal, full screen, full width. Clicking the badge
+  // on a card walks the three, and a snapshot fills it in from what was actually on screen.
+  function cycleState(tileId, app) {
+    if (!app) return
+    var next = Model.nextState(String(app.state || ""))
+    var name = app.name || app["class"]
+    root.editRoot(Model.withState(root.current.root, tileId, app["class"], next), tileId,
+                  next === "" ? name + " opens normally" : name + " opens " + Model.stateLabel(next))
+  }
+
+  // Floating windows a snapshot recorded. The editor lists them and can drop one; their
+  // place and size come from the workspace itself, so there is nothing to drag here.
+  function floatingWindows() {
+    var list = root.current && root.current.floating
+    return Array.isArray(list) ? list : []
+  }
+
+  function removeFloating(index) {
+    var list = root.floatingWindows()
+    if (index < 0 || index >= list.length) return
+    var ws = Model.clone(root.current)
+    var kept = []
+    for (var i = 0; i < list.length; i++) { if (i !== index) kept.push(list[i]) }
+    if (kept.length > 0) ws.floating = kept
+    else delete ws.floating
+    root.commit(ws, root.selected, (list[index].name || list[index]["class"]) + " will not be placed any more")
+  }
+
   function removeApp(tileId, cls) {
     root.editRoot(Model.unassign(root.current.root, tileId, cls), tileId)
   }

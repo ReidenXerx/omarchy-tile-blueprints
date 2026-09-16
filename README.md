@@ -78,8 +78,13 @@ Arrange a workspace by hand, snapshot it, and it comes back:
 - **fullscreen and full width** - an app you left fullscreen opens fullscreen.
 
 Floating windows and fullscreen come back as Hyprland window rules, so they apply to the
-app, the way pinning already does. The editor keeps them through a save but does not show
-them yet: to change them, arrange the workspace and snapshot it again.
+app, the way pinning already does.
+
+In the editor, each app card carries a badge saying how it opens - **full screen**, **full
+width**, or **opens normally** - and clicking the badge walks the three. Floating windows
+are listed in a strip under the canvas with their size; hover one to drop it from the
+blueprint. Where a floating window sits comes from the workspace itself, so to move it,
+move it there and snapshot again.
 
 ## Snapshot a workspace
 

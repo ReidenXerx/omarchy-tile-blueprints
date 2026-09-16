@@ -423,6 +423,29 @@ function defaultWorkspace() {
   return { root: newLeaf("t1"), launch: true, pin: true }
 }
 
+var MAX_FLOATING = 16
+
+// Floating windows a snapshot recorded: kept as they are, so a save does not throw away
+// what the editor has no controls for. The same checks the helper makes.
+function normalizeFloating(list) {
+  var out = []
+  if (!Array.isArray(list)) return out
+  for (var i = 0; i < list.length && out.length < MAX_FLOATING; i++) {
+    var w = list[i]
+    if (!w || typeof w !== "object") continue
+    var cls = String(w["class"] || "")
+    if (!cls) continue
+    if (![w.x, w.y, w.w, w.h].every(function(v) { return typeof v === "number" && isFinite(v) })) continue
+    if (!(w.w > 0 && w.h > 0)) continue
+    var kept = { "class": cls, name: String(w.name || cls), desktop: String(w.desktop || ""),
+                 x: w.x, y: w.y, w: w.w, h: w.h }
+    if (w.pinned === true) kept.pinned = true
+    if (w.state === "fullscreen" || w.state === "maximized") kept.state = w.state
+    out.push(kept)
+  }
+  return out
+}
+
 function normalizeFile(parsed) {
   var out = { version: 1, workspaces: {} }
   var src = parsed && typeof parsed === "object" && parsed.workspaces && typeof parsed.workspaces === "object"
@@ -430,11 +453,14 @@ function normalizeFile(parsed) {
   for (var key in src) {
     if (!/^[0-9]+$/.test(key)) continue
     var ws = src[key] || {}
-    out.workspaces[key] = {
+    var space = {
       root: normalize(ws.root),
       launch: ws.launch !== false,
       pin: ws.pin !== false
     }
+    var floating = normalizeFloating(ws.floating)
+    if (floating.length > 0) space.floating = floating
+    out.workspaces[key] = space
   }
   return out
 }
@@ -475,6 +501,38 @@ function savedForm(ws) {
 
 // Workspace numbers, ascending, whose blueprint in draft is not what saved holds. A workspace
 // not worth saving counts as having no blueprint, because saving leaves it out.
+// ------------------------------------------------------------------ window state
+
+// How an app opens on its workspace, cycled from the editor: normal, fullscreen, or the
+// full width Omarchy calls "maximized".
+function nextState(state) {
+  if (state === "fullscreen") return "maximized"
+  if (state === "maximized") return ""
+  return "fullscreen"
+}
+
+function stateLabel(state) {
+  if (state === "fullscreen") return "full screen"
+  if (state === "maximized") return "full width"
+  return ""
+}
+
+// A copy of the tree with one app's state set (or cleared, when state is "").
+function withState(root, tileId, cls, state) {
+  var tree = clone(root)
+  var all = leaves(tree)
+  var key = String(cls || "").toLowerCase()
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].id !== tileId) continue
+    for (var a = 0; a < all[i].apps.length; a++) {
+      if (String(all[i].apps[a]["class"]).toLowerCase() !== key) continue
+      if (state === "fullscreen" || state === "maximized") all[i].apps[a].state = state
+      else delete all[i].apps[a].state
+    }
+  }
+  return tree
+}
+
 function changedWorkspaces(saved, draft) {
   var a = (saved && saved.workspaces) || {}
   var b = (draft && draft.workspaces) || {}

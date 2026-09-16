@@ -9,7 +9,7 @@ const assert = require("assert")
 const root = path.resolve(__dirname, "..")
 const source = fs.readFileSync(path.join(root, "BlueprintModel.js"), "utf8").replace(/^\.pragma library\s*$/m, "")
 const ctx = {}
-vm.runInNewContext(source + "\nthis.M = { MIN_SIZE, clone, isLeaf, newLeaf, leaves, nextId, pathTo, nodeAt, findLeaf, normalize, split, remove, grow, moveDivider, assign, unassign, order, layout, neighbour, capture, defaultWorkspace, normalizeFile, appCount, isMeaningful, tileLabel, drop, dropLabel, stableJson, changedWorkspaces, listNumbers }", ctx)
+vm.runInNewContext(source + "\nthis.M = { MIN_SIZE, clone, isLeaf, newLeaf, leaves, nextId, pathTo, nodeAt, findLeaf, normalize, split, remove, grow, moveDivider, assign, unassign, order, layout, neighbour, capture, defaultWorkspace, normalizeFile, appCount, isMeaningful, tileLabel, drop, dropLabel, stableJson, changedWorkspaces, listNumbers, nextState, stateLabel, withState, normalizeFloating }", ctx)
 const M = ctx.M
 
 // vm-context objects carry that context's prototypes; compare plain copies.
@@ -306,6 +306,39 @@ test("a tile keeps the shares a resize wrote, and drops nonsense", () => {
   for (const bad of [[1], [0.5, "x"], [0.5, -1], "0.5,0.5"]) {
     assert.strictEqual(M.normalize({ id: "t1", apps: [], shares: bad }).shares, undefined)
   }
+})
+
+test("an app's state cycles and lands on the right tile", () => {
+  const root = M.normalize({ children: [
+    { id: "t1", apps: [{ "class": "code", name: "Code", desktop: "" }] },
+    { id: "t2", apps: [{ "class": "code2", name: "Code2", desktop: "" }] },
+  ] })
+  assert.strictEqual(M.nextState(""), "fullscreen")
+  assert.strictEqual(M.nextState("fullscreen"), "maximized")
+  assert.strictEqual(M.nextState("maximized"), "")
+  const full = M.withState(root, "t1", "code", "fullscreen")
+  eq(M.leaves(full).map(l => l.apps.map(a => a.state || "")), [["fullscreen"], [""]])
+  const cleared = M.withState(full, "t1", "CODE", "")
+  eq(M.leaves(cleared).map(l => l.apps.map(a => a.state || "")), [[""], [""]])
+  eq(M.leaves(root).map(l => l.apps.map(a => a.state || "")), [[""], [""]])   // the original is untouched
+})
+
+test("reading the file keeps floating windows and drops nonsense", () => {
+  const file = M.normalizeFile({ workspaces: { "1": {
+    root: { id: "t1", apps: [] },
+    floating: [
+      { "class": "mpv", name: "mpv", desktop: "", x: 1, y: 2, w: 3, h: 4, pinned: true, state: "fullscreen" },
+      { "class": "", x: 1, y: 2, w: 3, h: 4 },
+      { "class": "bad", x: 1, y: 2, w: 0, h: 4 },
+      { "class": "bad2", x: "1", y: 2, w: 3, h: 4 },
+      "nope",
+    ],
+  } } })
+  eq(file.workspaces["1"].floating, [
+    { "class": "mpv", name: "mpv", desktop: "", x: 1, y: 2, w: 3, h: 4, pinned: true, state: "fullscreen" },
+  ])
+  assert.strictEqual(M.normalizeFile({ workspaces: { "2": { root: { id: "t1", apps: [] } } } })
+    .workspaces["2"].floating, undefined)
 })
 
 console.log(`${passed} passed, ${failures.length} failed`)
