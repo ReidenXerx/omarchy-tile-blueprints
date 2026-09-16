@@ -111,7 +111,7 @@ io.write(table.concat(out, "\n"), "\n")
 
 
 LUA_RESIZE_HARNESS = r"""
-local path, classes, active, axis, delta, times = ...
+local path, classes, active, axis, delta, times, swap = ...
 local registered, exec, timers, dispatched = nil, {}, {}, {}
 ACTIVE = nil
 hl = {
@@ -144,6 +144,11 @@ local ctx = {
 }
 
 registered.recalculate(ctx)
+if swap == "swap" then
+  targets[1], targets[2] = targets[2], targets[1]
+  ctx.targets = targets
+  registered.recalculate(ctx)
+end
 ACTIVE = targets[tonumber(active)].window
 local moved = false
 for _ = 1, tonumber(times or 1) do
@@ -153,6 +158,7 @@ end
 for _, fn in ipairs(timers) do fn() end
 
 io.write("moved ", tostring(moved), "\n")
+for i, target in ipairs(targets) do io.write("order ", i, " ", target.window.class, "\n") end
 for i, target in ipairs(targets) do
   io.write("box ", i, " ", target.box.x, " ", target.box.y, " ", target.box.w, " ", target.box.h, "\n")
 end
@@ -409,13 +415,14 @@ class Resize(Sandbox):
                 "children": [leaf([{"class": "foot", "name": "Foot", "desktop": ""}]),
                              leaf([{"class": "code", "name": "Code", "desktop": ""}])]}
 
-    def resize_run(self, doc, classes, active, axis, delta, times=1):
+    def resize_run(self, doc, classes, active, axis, delta, times=1, swap=False):
         text = self.h.generate(self.h.normalize_document(doc, strict=True)[0])
         path = self.dir / "generated.lua"
         path.write_text(text)
         harness = self.dir / "resize.lua"
         harness.write_text(LUA_RESIZE_HARNESS)
-        r = self.lua("lua", str(harness), str(path), classes, str(active), axis, str(delta), str(times))
+        r = self.lua("lua", str(harness), str(path), classes, str(active), axis, str(delta), str(times),
+                     "swap" if swap else "")
         self.assertTrue(r.ok, r.stderr.decode())
         return r.stdout.decode()
 
@@ -456,6 +463,36 @@ class Resize(Sandbox):
     def test_one_window_alone_has_no_border_to_move(self):
         out = self.resize_run(document(w1=self.split()), "foot", 1, "x", -100)
         self.assertIn("moved false", out)
+
+    def test_a_swap_inside_a_tile_is_written_back(self):
+        doc = document(w1=leaf([{"class": "foot", "name": "Foot", "desktop": ""},
+                                {"class": "code", "name": "Code", "desktop": ""}]))
+        out = self.resize_run(doc, "foot,code", 1, "x", 0, swap=True)
+        self.assertRegex(out, r"exec .*set-sizes 1 'o:=2,1'")
+
+    def test_a_tile_is_laid_out_in_the_order_the_blueprint_lists(self):
+        doc = document(w1=leaf([{"class": "code", "name": "Code", "desktop": ""},
+                                {"class": "foot", "name": "Foot", "desktop": ""}]))
+        # The windows arrive foot first; the blueprint says code first, and that wins on the
+        # first layout - which is how a saved swap comes back after a restart.
+        out = self.resize_run(doc, "foot,code", 1, "x", 0)
+        widths = [line.split()[2] for line in out.splitlines() if line.startswith("box")]
+        self.assertEqual(widths, ["0", "500"])
+        order = [line.split()[2] for line in out.splitlines() if line.startswith("order")]
+        self.assertEqual(order, ["foot", "code"])   # targets untouched; only the placement moved
+
+    def test_set_sizes_reorders_a_tile(self):
+        self.write_config(document(w1=leaf(["foot", "code", "mpv"])))
+        self.assertEqual(self.capture(self.h.cmd_set_sizes, ["1", "o:=3,1,2"])[0], 0)
+        apps = json.loads(self.h.CONFIG.read_bytes())["workspaces"]["1"]["root"]["apps"]
+        self.assertEqual([a["class"] for a in apps], ["mpv", "foot", "code"])
+
+    def test_an_order_that_is_not_a_permutation_is_ignored(self):
+        self.write_config(document(w1=leaf(["foot", "code"])))
+        for payload in ("o:=1,1", "o:=1", "o:=1,2,3", "o:=0,1", "o:=1.5,2"):
+            self.assertEqual(self.capture(self.h.cmd_set_sizes, ["1", payload])[0], 0, payload)
+        apps = json.loads(self.h.CONFIG.read_bytes())["workspaces"]["1"]["root"]["apps"]
+        self.assertEqual([a["class"] for a in apps], ["foot", "code"])
 
     # ---- the generated file
 

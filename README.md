@@ -123,6 +123,10 @@ It works both between tiles and between windows that share one tile. A border st
 than swallowing its neighbour, and on a workspace without a blueprint the keys do what they
 always did.
 
+**Swapping is remembered too.** Swap two windows that share a tile (`SUPER + SHIFT` and an
+arrow) and the blueprint lists their apps in the new order, so they come back that way.
+Sizes stay with the places, not the windows, which is how Hyprland's own layouts swap.
+
 Hyprland's Lua layout API has no resize hook at all, so the plugin takes these keys over
 and drives the layout itself. (It also repairs them on the way: Omarchy writes them as
 `SUPER + code:20`, which Hyprland 0.56's Lua config parser mis-reads, leaving them dead.)

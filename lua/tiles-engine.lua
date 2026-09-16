@@ -19,7 +19,10 @@ __omarchy_tiles = __omarchy_tiles or { workspaces = {} }
 -- What the last recalculate produced: the box every node was given, and which children of
 -- a split actually took space. Resizing needs both, because a tile whose apps are absent
 -- collapses, and a collapsed neighbour must not be handed part of the drag.
-local live = { boxes = {}, present = {}, windows = {}, dir = {} }
+local live = { boxes = {}, present = {}, windows = {}, dir = {}, path = {}, ordered = {} }
+
+-- Defined with the rest of the saving, below, but called from recalculate above it.
+local remember_order
 
 local function lower(s)
   return string.lower(tostring(s or ""))
@@ -90,8 +93,38 @@ local function occupied(node, assigned)
   return assigned[node] ~= nil and #assigned[node] > 0
 end
 
-local function place_node(node, box, assigned)
+-- Where a window's app sits in its tile's list, or a large number for one the tile does not
+-- list (an unlisted window sharing the biggest tile).
+local function app_rank(node, window)
+  if not node.apps then return math.huge end
+  local class, initial = lower(window and window.class), lower(window and window.initial_class)
+  for i, app in ipairs(node.apps) do
+    local a = lower(app)
+    if a ~= "" and (a == class or a == initial) then return i end
+  end
+  return math.huge
+end
+
+-- Put the windows of a tile in the order the blueprint lists their apps, keeping the order
+-- they arrived in as the tie-break. Only for a tile being laid out for the first time: once
+-- it is on screen, swapping two windows should move them, not be undone on the next frame.
+local function in_blueprint_order(node, windows)
+  local decorated = {}
+  for i, target in ipairs(windows) do
+    decorated[i] = { target = target, rank = app_rank(node, target.window), arrived = i }
+  end
+  table.sort(decorated, function(a, b)
+    if a.rank ~= b.rank then return a.rank < b.rank end
+    return a.arrived < b.arrived
+  end)
+  local out = {}
+  for i, item in ipairs(decorated) do out[i] = item.target end
+  return out
+end
+
+local function place_node(node, box, assigned, path)
   live.boxes[node] = box
+  live.path[node] = path or ""
   if node.children then
     local present, weights, indices = {}, {}, {}
     for i, child in ipairs(node.children) do
@@ -103,11 +136,19 @@ local function place_node(node, box, assigned)
     end
     live.present[node] = indices
     local boxes = divide(box, node.dir == "v" and "v" or "h", weights)
-    for i, child in ipairs(present) do place_node(child, boxes[i], assigned) end
+    for i, child in ipairs(present) do
+      place_node(child, boxes[i], assigned,
+        (path == "" or path == nil) and tostring(indices[i]) or (path .. "." .. indices[i]))
+    end
     return
   end
   local windows = assigned[node]
   if not windows or #windows == 0 then return end
+  if not live.ordered[node] and #windows > 1 then
+    windows = in_blueprint_order(node, windows)
+    assigned[node] = windows
+    live.ordered[node] = true
+  end
   -- Several windows in one tile: split it along its longer side, evenly unless the
   -- blueprint carries shares for exactly this many windows (a resize inside the tile).
   local dir = box.w >= box.h and "h" or "v"
@@ -141,7 +182,7 @@ end
 local function recalculate(ctx)
   local targets = ctx.targets
   if #targets == 0 then return end
-  live.boxes, live.present, live.windows, live.dir = {}, {}, {}, {}
+  live.boxes, live.present, live.windows, live.dir, live.path = {}, {}, {}, {}, {}
   local key = workspace_key(targets)
   local schema = key and __omarchy_tiles.workspaces[key]
   if not schema then return fallback_grid(ctx) end
@@ -165,7 +206,8 @@ local function recalculate(ctx)
     assigned[big] = assigned[big] or {}
     for _, target in ipairs(spill) do table.insert(assigned[big], target) end
   end
-  place_node(schema, ctx.area, assigned)
+  place_node(schema, ctx.area, assigned, "")
+  remember_order(key, schema, assigned)
 end
 
 -- ── resizing ────────────────────────────────────────────────────────────────────────────
@@ -225,8 +267,10 @@ local function flush_saves()
   for key, splits in pairs(pending) do
     local parts = {}
     for where, sizes in pairs(splits) do
+      -- An order is a list of places, a share is a fraction.
+      local shape = where:sub(1, 2) == "o:" and "%d" or "%.4f"
       local numbers = {}
-      for i, size in ipairs(sizes) do numbers[i] = string.format("%.4f", size) end
+      for i, size in ipairs(sizes) do numbers[i] = string.format(shape, size) end
       parts[#parts + 1] = where .. "=" .. table.concat(numbers, ",")
     end
     if command and #parts > 0 then
@@ -250,6 +294,37 @@ local function remember(key, kind, path, values)
       save_queued = false
       flush_saves()
     end, { type = "oneshot", timeout = 400 })
+  end
+end
+
+-- A swap inside a tile reorders the windows on screen. Write that back, so the blueprint
+-- lists the apps in the order they are actually in and the next start-up reproduces it.
+-- Slot sizes stay where they are: swapping two windows exchanges their places, the way
+-- Hyprland's own layouts do it.
+function remember_order(key, schema, assigned)
+  if not key then return end
+  for node, windows in pairs(assigned) do
+    if node.apps and #node.apps > 1 and #windows > 1 then
+      local order, seen, changed = {}, {}, false
+      for i, target in ipairs(windows) do
+        local rank = app_rank(node, target.window)
+        if rank ~= math.huge and not seen[rank] then
+          seen[rank] = true
+          order[#order + 1] = rank
+          if rank ~= #order then changed = true end
+        end
+      end
+      if changed and #order > 1 then
+        for i = 1, #node.apps do
+          if not seen[i] then order[#order + 1] = i end
+        end
+        local apps = {}
+        for i, from in ipairs(order) do apps[i] = node.apps[from] end
+        node.apps = apps
+        for i = 1, #order do order[i] = order[i] end
+        remember(key, "o", live.path[node] or "", order)
+      end
+    end
   end
 end
 

@@ -13,8 +13,9 @@
                                        as its blueprint, then apply
   tile-blueprints apps                 apps to assign: running windows and installed apps, JSON
   tile-blueprints active-workspace     the focused workspace id, as JSON
-  tile-blueprints set-sizes <ws> <p>   store new shares ('s:path=a,b;w:path=a,b') in the
-                                       blueprint; the layout engine calls this after a resize
+  tile-blueprints set-sizes <ws> <p>   store what the layout changed ('s:path=a,b' split
+                                       shares, 'w:path=a,b' inside a tile, 'o:path=2,1' the
+                                       order after a swap); the layout engine calls this
   tile-blueprints status               what is configured and whether Hyprland has it
   tile-blueprints remove               delete the generated layout file and reload
 
@@ -1332,8 +1333,8 @@ def cmd_set_sizes(args):
     for entry in entries:
         where, sep, raw = entry.partition("=")
         kind, _, path = where.partition(":")
-        if not sep or kind not in ("s", "w"):
-            return fail("set-sizes: expected s:path=sizes or w:path=shares", 2)
+        if not sep or kind not in ("s", "w", "o"):
+            return fail("set-sizes: expected s:path=sizes, w:path=shares or o:path=order", 2)
         node = find_node(space["root"], path)
         if node is None:
             return 0  # the blueprint changed under us; the next apply wins
@@ -1343,7 +1344,15 @@ def cmd_set_sizes(args):
             return fail("set-sizes: sizes must be numbers", 2)
         if not all(value == value and 0 < value < 1e6 for value in values):
             return 0
-        if kind == "s":
+        if kind == "o":
+            # A swap inside a tile: the same apps, in the order they are now on screen.
+            apps = node.get("apps")
+            order = [int(value) for value in values if float(value).is_integer()]
+            if (node.get("children") is not None or not isinstance(apps, list)
+                    or len(order) != len(values) or sorted(order) != list(range(1, len(apps) + 1))):
+                return 0
+            node["apps"] = [apps[i - 1] for i in order]
+        elif kind == "s":
             # between tiles: one share per child of this split
             if not isinstance(node.get("children"), list) or len(values) != len(node["children"]):
                 return 0
