@@ -374,6 +374,18 @@ test("the display chip cycles any display and each connected one", () => {
   assert.strictEqual(M.monitorLabel("unplugged", list), "unplugged")
 })
 
+test("the display chip walks every connected display, however many there are", () => {
+  const list = [1, 2, 3, 4, 5].map(n => ({ name: "DP-" + n, rule: "desc:Panel " + n }))
+  let at = ""
+  const seen = []
+  for (let i = 0; i <= list.length; i++) { at = M.nextMonitor(at, list); seen.push(at) }
+  eq(seen, ["desc:Panel 1", "desc:Panel 2", "desc:Panel 3", "desc:Panel 4", "desc:Panel 5", ""],
+     "any display, each screen in turn, then back to any display")
+  eq(M.monitorLabel("desc:Panel 4", list), "DP-4", "the fourth display's own name")
+  const one = [{ name: "eDP-1", rule: "eDP-1" }]
+  eq([M.nextMonitor("", one), M.nextMonitor("eDP-1", one)], ["eDP-1", ""], "a single display still cycles")
+})
+
 console.log(`${passed} passed, ${failures.length} failed`)
 for (const f of failures) console.log("  FAIL " + f)
 process.exit(failures.length ? 1 : 0)

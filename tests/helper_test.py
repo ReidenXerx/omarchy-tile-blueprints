@@ -422,6 +422,16 @@ class Lua(Sandbox):
         plain = self.h.generate(self.h.normalize_document(document(w4=leaf(["foot"])), strict=True)[0])
         self.assertNotIn("monitor =", plain)
 
+    def test_every_workspace_carries_its_own_display(self):
+        doc = {"version": 1, "workspaces": {
+            str(n): {"root": leaf([f"app{n}"]), "launch": True, "pin": True, "monitor": f"desc:Panel {n}"}
+            for n in range(1, 5)}}
+        text = self.h.generate(self.h.normalize_document(doc, strict=True)[0])
+        for n in range(1, 5):
+            self.assertIn(f'monitor = "desc:Panel {n}"', text)
+        self.assertEqual(text.count("monitor = "), 4)
+        self.assertEqual(text.count("persistent = true"), 4)
+
     def test_no_launch_lines_without_trusted_tools(self):
         self.h.launch_tools = lambda: None
         doc = document(w1=leaf([{"class": "foot", "name": "Foot", "desktop": "foot"}]))
@@ -1366,6 +1376,16 @@ class Snapshot(Sandbox):
                          ["desc:Dell Inc. DELL S2721DGF DCRD223", "DP-2", "HDMI-A-1"])
         self.assertEqual([m["workspace"] for m in got], [1, 2, 0])
         self.assertEqual(got[0]["width"], 2560)
+
+    def test_monitors_lists_every_connected_display_up_to_the_cap(self):
+        self.monitors = [{"name": f"DP-{n}", "description": f"Panel {n}", "width": 1920, "height": 1080}
+                         for n in range(1, 7)]
+        got = json.loads(self.capture(self.h.cmd_monitors, [])[1])
+        self.assertEqual([m["name"] for m in got], [f"DP-{n}" for n in range(1, 7)])
+        self.assertEqual(got[4]["rule"], "desc:Panel 5")
+        self.monitors = [{"name": f"OUT-{n}", "description": ""} for n in range(1, self.h.MAX_MONITORS + 5)]
+        capped = json.loads(self.capture(self.h.cmd_monitors, [])[1])
+        self.assertEqual(len(capped), self.h.MAX_MONITORS)
 
     def test_monitors_fails_when_hyprland_cannot_answer(self):
         self.h.hypr_json = lambda *args: None
