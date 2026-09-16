@@ -5,7 +5,7 @@
 //
 // A split is { dir: "h" | "v", sizes: [..fractions..], children: [..nodes..] } -- "h" lays
 // children left to right, "v" top to bottom. A leaf (a tile) is
-// { id: "t3", apps: [{ class, name, desktop }] }. The same shape is what the Lua layout
+// { id: "t3", apps: [{ class, name, desktop, state? }] }. The same shape is what the Lua layout
 // engine reads, so what the editor draws is what Hyprland does.
 
 var MIN_SIZE = 0.08
@@ -93,7 +93,10 @@ function normalize(node) {
       var key = String(app && app["class"] || "").toLowerCase()
       if (!key || seen[key]) continue
       seen[key] = true
-      apps.push({ "class": String(app["class"]), name: String(app.name || app["class"]), desktop: String(app.desktop || "") })
+      var kept = { "class": String(app["class"]), name: String(app.name || app["class"]), desktop: String(app.desktop || "") }
+      // How the app was opened - fullscreen, or full width - captured from the workspace.
+      if (app.state === "fullscreen" || app.state === "maximized") kept.state = app.state
+      apps.push(kept)
     }
     all[k].apps = apps
   }
@@ -407,7 +410,9 @@ function cut(items, box, tol, counter) {
     var key = String(items[i]["class"] || "").toLowerCase()
     if (!key || seen[key]) continue
     seen[key] = true
-    leaf.apps.push({ "class": items[i]["class"], name: items[i].name || items[i]["class"], desktop: items[i].desktop || "" })
+    var app = { "class": items[i]["class"], name: items[i].name || items[i]["class"], desktop: items[i].desktop || "" }
+    if (items[i].state === "fullscreen" || items[i].state === "maximized") app.state = items[i].state
+    leaf.apps.push(app)
   }
   return leaf
 }

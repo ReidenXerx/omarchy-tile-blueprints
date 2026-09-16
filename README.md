@@ -68,6 +68,19 @@ Saving applies at once: Hyprland reloads, and running apps that belong elsewhere
 their workspace. The editor also asks before anything else closes it with changes still unsaved: a click
 outside, or its key pressed again.
 
+## What a snapshot remembers
+
+Arrange a workspace by hand, snapshot it, and it comes back:
+
+- **the tiling** - which app sits in which tile, and the proportions;
+- **windows that share a tile**, in the proportion you left them;
+- **floating windows** - where they sit, how big they are, and whether they were pinned;
+- **fullscreen and full width** - an app you left fullscreen opens fullscreen.
+
+Floating windows and fullscreen come back as Hyprland window rules, so they apply to the
+app, the way pinning already does. The editor keeps them through a save but does not show
+them yet: to change them, arrange the workspace and snapshot it again.
+
 ## Snapshot a workspace
 
 Arrange a workspace by hand, then save it as its blueprint without opening the editor:
@@ -145,7 +158,7 @@ edited**. The generated file:
 tile-blueprints status     # what is configured, and what Hyprland is using
 tile-blueprints apply      # regenerate, reload, arrange
 tile-blueprints arrange    # just move running apps to their workspaces
-tile-blueprints windows 2  # windows on workspace 2 as JSON (what capture reads)
+tile-blueprints windows 2  # workspace 2 as JSON: {"tiled": [...], "floating": [...]}
 tile-blueprints snapshot   # save the windows on this workspace as its blueprint
 tile-blueprints remove     # turn blueprints off (keeps your saved blueprints)
 tile-blueprints set-sizes 1 's:=0.4,0.6'   # store new proportions (what a resize calls)

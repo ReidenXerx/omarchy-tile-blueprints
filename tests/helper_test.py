@@ -605,6 +605,92 @@ class Resize(Sandbox):
         self.assertEqual(widths, [500, 500])
 
 
+class FullSnapshot(Sandbox):
+    """A snapshot takes the whole workspace: the tiling, what floats and where, and what was
+    opened fullscreen."""
+
+    def base(self, **extra):
+        out = {"workspace": {"id": 2}, "floating": False, "mapped": True, "hidden": False,
+               "at": [10, 20], "size": [300, 400], "fullscreen": 0}
+        out.update(extra)
+        return out
+
+    def test_a_workspace_is_read_in_two_lists(self):
+        self.clients = [self.base(**{"class": "foot"}),
+                        self.base(**{"class": "mpv"}, floating=True, at=[100, 200], size=[640, 480], pinned=True),
+                        self.base(**{"class": "brave"}, fullscreen=2),
+                        self.base(**{"class": "zed"}, fullscreen=1)]
+        state = self.h.workspace_windows(2)
+        self.assertEqual([w["class"] for w in state["tiled"]], ["foot", "brave", "zed"])
+        self.assertEqual(state["floating"], [{"class": "mpv", "name": "mpv", "desktop": "",
+                                              "x": 100, "y": 200, "w": 640, "h": 480, "pinned": True}])
+        self.assertEqual([w.get("state", "") for w in state["tiled"]], ["", "fullscreen", "maximized"])
+
+    def test_a_snapshot_keeps_all_of_it(self):
+        self.write_config(document())
+        self.clients = [self.base(**{"class": "foot"}, at=[0, 0], size=[500, 800]),
+                        self.base(**{"class": "brave"}, at=[500, 0], size=[500, 800], fullscreen=2),
+                        self.base(**{"class": "mpv"}, floating=True, at=[100, 200], size=[640, 480])]
+        self.active = {"id": 2}
+        code, _, err = self.capture(self.h.cmd_snapshot, [])
+        self.assertEqual(code, 0, err)
+        ws = json.loads(self.h.CONFIG.read_bytes())["workspaces"]["2"]
+        states = {a["class"]: a.get("state", "") for a in self.h.apps_of(ws["root"])}
+        self.assertEqual(states, {"foot": "", "brave": "fullscreen"})
+        self.assertEqual([(f["class"], f["x"], f["w"]) for f in ws["floating"]], [("mpv", 100, 640)])
+        self.assertIn("floating window", self.notes[-1][1])
+
+    def test_the_rules_put_it_all_back(self):
+        doc = document(w1=leaf([{"class": "code", "name": "Code", "desktop": ""}]))
+        doc["workspaces"]["1"]["root"]["apps"][0]["state"] = "fullscreen"
+        doc["workspaces"]["1"]["floating"] = [{"class": "mpv", "name": "mpv", "desktop": "",
+                                               "x": 100, "y": 200, "w": 640, "h": 480, "pinned": True,
+                                               "state": "maximized"}]
+        text = self.h.generate(self.h.normalize_document(doc, strict=True)[0])
+        self.assertIn('hl.window_rule({ match = { class = "^code$" }, fullscreen = true })', text)
+        self.assertIn('hl.window_rule({ match = { class = "^mpv$" }, float = true, move = "100 200", '
+                      'size = "640 480", pin = true, workspace = "1 silent" })', text)
+        self.assertIn('hl.window_rule({ match = { class = "^mpv$" }, maximize = true })', text)
+
+    def test_floating_windows_are_checked_like_everything_else(self):
+        doc = document(w1=leaf([{"class": "code", "name": "Code", "desktop": ""}]))
+        doc["workspaces"]["1"]["floating"] = [
+            {"class": "ok", "name": "Ok", "desktop": "", "x": 1, "y": 2, "w": 3, "h": 4},
+            {"class": "code", "name": "Code", "desktop": "", "x": 1, "y": 2, "w": 3, "h": 4},  # already tiled
+            {"class": "nan", "x": float("nan"), "y": 2, "w": 3, "h": 4},
+            {"class": "big", "x": 0, "y": 0, "w": 10 ** 9, "h": 4},
+            {"class": "zero", "x": 0, "y": 0, "w": 0, "h": 4},
+            {"class": "bool", "x": True, "y": 0, "w": 4, "h": 4},
+            {"class": "gone", "x": 1, "y": 2, "w": 3},
+            "not a window",
+        ] + [{"class": f"many{i}", "x": 1, "y": 2, "w": 3, "h": 4} for i in range(40)]
+        out, _ = self.h.normalize_document(doc, strict=True)
+        kept = out["workspaces"]["1"]["floating"]
+        self.assertEqual(kept[0], {"class": "ok", "name": "Ok", "desktop": "", "x": 1, "y": 2, "w": 3, "h": 4})
+        self.assertEqual(len(kept), self.h.MAX_FLOATING)
+        self.assertNotIn("code", [f["class"] for f in kept])
+        self.assertNotIn("nan", [f["class"] for f in kept])
+        self.assertNotIn("big", [f["class"] for f in kept])
+        self.assertNotIn("zero", [f["class"] for f in kept])
+        self.assertNotIn("gone", [f["class"] for f in kept])
+
+    def test_a_state_that_is_not_a_state_is_dropped(self):
+        doc = document(w1=leaf([{"class": "code", "name": "Code", "desktop": "", "state": "sideways"}]))
+        out, _ = self.h.normalize_document(doc, strict=True)
+        self.assertNotIn("state", list(self.h.apps_of(out["workspaces"]["1"]["root"]))[0])
+
+    def test_a_floating_change_is_a_rules_change_so_it_reloads(self):
+        self.write_config(document(w1=leaf(["code"])))
+        self.capture(self.h.cmd_apply, [])
+        self.calls.clear()
+        doc = document(w1=leaf(["code"]))
+        doc["workspaces"]["1"]["floating"] = [{"class": "mpv", "name": "mpv", "desktop": "",
+                                               "x": 1, "y": 2, "w": 3, "h": 4}]
+        self.write_config(doc)
+        self.capture(self.h.cmd_apply, [])
+        self.assertIn("reload", [c[0] for c in self.calls])
+
+
 class Apply(Sandbox):
     def valid(self):
         return document(w2=split(leaf([{"class": "code", "name": "Code", "desktop": "code"}]), leaf(["foot"])))
@@ -983,10 +1069,12 @@ class Discovery(Sandbox):
                          dict(base, **{"class": "evil\n\"]]"})]
                         + [dict(base, **{"class": f"many{i}"}) for i in range(300)])
         code, out, _ = self.capture(self.h.cmd_windows, ["2"])
-        windows = json.loads(out)
+        state = json.loads(out)
+        windows, floating = state["tiled"], state["floating"]
         self.assertEqual(code, 0)
-        self.assertEqual(len(windows), 256 - 5)  # clients() itself stops at 256
+        self.assertEqual(len(windows), 256 - 5)  # clients() itself stops at 256; the floating one is listed apart
         self.assertEqual(windows[0], {"class": "foot", "name": "foot", "desktop": "", "x": 10, "y": 20, "w": 300, "h": 400})
+        self.assertEqual([w["class"] for w in floating], ["fl"])   # kept now, with where it sits
         self.assertEqual(windows[1]["class"], "")
         for bad in (["1; rm"], ["0"], ["100"], [], ["1", "2"], ["-1"]):
             self.assertEqual(self.capture(self.h.cmd_windows, bad)[0], 2, bad)

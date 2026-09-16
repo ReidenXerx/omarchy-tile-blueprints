@@ -96,6 +96,9 @@ MAX_WORKSPACES = 10
 MAX_WORKSPACE_ID = 99
 MAX_TILES = 64                    # per workspace
 MAX_WINDOW_SHARES = 16            # windows whose split inside one tile is remembered
+MAX_FLOATING = 16                 # floating windows remembered per workspace
+WINDOW_STATES = ("fullscreen", "maximized")
+MAX_COORD = 20000                 # pixels: the bounds a remembered position must sit in
 MAX_APPS_PER_TILE = 32
 MAX_DEPTH = 16                    # split levels
 MAX_TEXT = 256                    # class and name length
@@ -263,8 +266,11 @@ def _normalize_tree(node, state, depth):
             continue  # a class lives in one tile only, as in the editor
         state["classes"].add(cls.lower())
         desktop = app.get("desktop")
-        apps.append({"class": cls, "name": clean_text(app.get("name")) or cls,
-                     "desktop": desktop if valid_desktop(desktop) else ""})
+        entry = {"class": cls, "name": clean_text(app.get("name")) or cls,
+                 "desktop": desktop if valid_desktop(desktop) else ""}
+        if app.get("state") in WINDOW_STATES:
+            entry["state"] = app["state"]
+        apps.append(entry)
     leaf_id = node.get("id")
     leaf = {"id": leaf_id if isinstance(leaf_id, str) and LEAF_ID.fullmatch(leaf_id) else None, "apps": apps}
     # Shares for windows that end up in this one tile, written by a resize. They are
@@ -296,13 +302,57 @@ def _assign_ids(leaves):
             used.add(leaf["id"])
 
 
+def _coordinate(value, low, high):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return None
+    number = int(value)
+    return number if low <= number <= high else None
+
+
+def normalize_floating(items, state):
+    """Floating windows to put back where they were. A class that already tiles somewhere is
+    left out: a window either has a tile or floats, never both."""
+    out = []
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        if len(out) >= MAX_FLOATING:
+            break
+        if not isinstance(item, dict) or not valid_class(item.get("class")):
+            continue
+        cls = item["class"]
+        if cls.lower() in state["classes"]:
+            continue
+        x = _coordinate(item.get("x"), -MAX_COORD, MAX_COORD)
+        y = _coordinate(item.get("y"), -MAX_COORD, MAX_COORD)
+        w = _coordinate(item.get("w"), 1, MAX_COORD)
+        h = _coordinate(item.get("h"), 1, MAX_COORD)
+        if None in (x, y, w, h):
+            continue
+        state["classes"].add(cls.lower())
+        desktop = item.get("desktop")
+        window = {"class": cls, "name": clean_text(item.get("name")) or cls,
+                  "desktop": desktop if valid_desktop(desktop) else "",
+                  "x": x, "y": y, "w": w, "h": h}
+        if item.get("pinned") is True:
+            window["pinned"] = True
+        if item.get("state") in WINDOW_STATES:
+            window["state"] = item["state"]
+        out.append(window)
+    return out
+
+
 def normalize_workspace(ws):
     if not isinstance(ws, dict) or not isinstance(ws.get("root"), dict):
         raise Invalid("has no root tile")
     state = {"tiles": 0, "classes": set(), "leaves": []}
     root = _normalize_tree(ws["root"], state, 0)
     _assign_ids(state["leaves"])
-    return {"root": root, "launch": ws.get("launch") is not False, "pin": ws.get("pin") is not False}
+    out = {"root": root, "launch": ws.get("launch") is not False, "pin": ws.get("pin") is not False}
+    floating = normalize_floating(ws.get("floating"), state)
+    if floating:
+        out["floating"] = floating
+    return out
 
 
 def normalize_document(data, strict=False):
@@ -519,6 +569,12 @@ def push_trees(doc):
     return bool(r is not None and r.ok and r.text().strip().startswith("ok"))
 
 
+def state_rule(cls, state):
+    """Opening this app fullscreen, or at full width the way Omarchy's SUPER + ALT + F does."""
+    action = "fullscreen = true" if state == "fullscreen" else "maximize = true"
+    return "hl.window_rule({ match = { class = " + lua_str(class_regex(cls)) + " }, " + action + " })"
+
+
 def generate(doc):
     """The Lua layout file for a normalized document."""
     engine = read_engine()
@@ -556,7 +612,25 @@ def generate(doc):
             if ws["pin"]:
                 lines.append(f'hl.window_rule({{ match = {{ class = {lua_str(class_regex(app["class"]))} }}, '
                              f'workspace = {lua_str(key + " silent")} }})')
+            if app.get("state"):
+                lines.append(state_rule(app["class"], app["state"]))
             desktop = app["desktop"]
+            if ws["launch"] and valid_desktop(desktop) and desktop not in launches:
+                launches.append(desktop)
+        # Floating windows are not part of the tiling, so they come back as rules: float
+        # where they were, the size they were, pinned if they were pinned.
+        for window in ws.get("floating", []):
+            parts = [f'match = {{ class = {lua_str(class_regex(window["class"]))} }}', "float = true",
+                     f'move = {lua_str("%d %d" % (window["x"], window["y"]))}',
+                     f'size = {lua_str("%d %d" % (window["w"], window["h"]))}']
+            if window.get("pinned"):
+                parts.append("pin = true")
+            if ws["pin"]:
+                parts.append(f'workspace = {lua_str(key + " silent")}')
+            lines.append("hl.window_rule({ " + ", ".join(parts) + " })")
+            if window.get("state"):
+                lines.append(state_rule(window["class"], window["state"]))
+            desktop = window.get("desktop", "")
             if ws["launch"] and valid_desktop(desktop) and desktop not in launches:
                 launches.append(desktop)
     tools = launch_tools() if launches else None
@@ -954,31 +1028,62 @@ def _pair(value):
     return None
 
 
-def tiled_windows(ws):
-    """The tiled windows on workspace ws with the app each belongs to and its geometry: what
-    capture reads."""
+def window_state(c):
+    """Hyprland's fullscreen mode as a word: 2 is a real fullscreen, 1 is Omarchy's "full
+    width" (maximized inside the layout), 0 is neither."""
+    mode = c.get("fullscreen")
+    if mode == 2:
+        return "fullscreen"
+    if mode == 1:
+        return "maximized"
+    return ""
+
+
+def workspace_windows(ws):
+    """Everything on workspace ws worth remembering: the tiled windows that make up the
+    layout, and the floating ones with where they sit. Each carries the app it belongs to
+    and, when it is fullscreen or full width, that state."""
     index = class_index(desktop_entries())
-    out = []
+    tiled, floating = [], []
     for c in clients():
         workspace = c.get("workspace") if isinstance(c.get("workspace"), dict) else {}
         if type(workspace.get("id")) is not int or workspace["id"] != ws:
             continue
-        if c.get("floating") or c.get("mapped", True) is False or c.get("hidden"):
+        if c.get("mapped", True) is False or c.get("hidden"):
             continue
         at, size = _pair(c.get("at")), _pair(c.get("size"))
         if at is None or size is None:
             continue
         cls = c.get("class") if valid_class(c.get("class")) else ""
         e = index.get(cls.lower()) if cls else None
-        out.append({"class": cls, "name": e["name"] if e else cls, "desktop": e["desktop"] if e else "",
-                    "x": at[0], "y": at[1], "w": size[0], "h": size[1]})
-    return out
+        window = {"class": cls, "name": e["name"] if e else cls, "desktop": e["desktop"] if e else "",
+                  "x": at[0], "y": at[1], "w": size[0], "h": size[1]}
+        state = window_state(c)
+        if state:
+            window["state"] = state
+        if c.get("floating"):
+            if c.get("pinned"):
+                window["pinned"] = True
+            floating.append(window)
+        else:
+            tiled.append(window)
+    return {"tiled": tiled[:MAX_WINDOWS], "floating": floating[:MAX_FLOATING]}
+
+
+def tiled_windows(ws):
+    return workspace_windows(ws)["tiled"]
 
 
 def cmd_windows(args):
     if len(args) != 1 or not WORKSPACE_KEY.fullmatch(args[0]):
         return fail(f"windows needs a workspace number (1-{MAX_WORKSPACE_ID})", 2)
-    print_bounded(tiled_windows(int(args[0])), MAX_WINDOWS)
+    state = workspace_windows(int(args[0]))
+    blob = json.dumps(state, ensure_ascii=False, allow_nan=False)
+    # Bounded like every other listing: drop the tail rather than print without a ceiling.
+    while len(blob.encode("utf-8")) > OUTPUT_MAX and (state["tiled"] or state["floating"]):
+        (state["floating"] if state["floating"] else state["tiled"]).pop()
+        blob = json.dumps(state, ensure_ascii=False, allow_nan=False)
+    print(blob)
     return 0
 
 
@@ -1050,8 +1155,16 @@ def snapshot_summary(ws, previous):
     where = {(True, True): "Its apps open here and start at login.", (True, False): "Its apps open here.",
              (False, True): "Its apps start at login.",
              (False, False): "Layout only: apps still open wherever you start them."}[(ws["pin"], ws["launch"])]
-    return "\n".join([f"{tiles} tile{'s' if tiles != 1 else ''}: {', '.join(names) if names else 'no apps'}",
-                      ("Replaced the blueprint it had. " if previous else "") + where])
+    extras = []
+    loose = len(ws.get("floating", []))
+    if loose:
+        extras.append(f"{loose} floating window{'s' if loose != 1 else ''} kept where they were")
+    states = sum(1 for a in apps_of(ws["root"]) if a.get("state")) + sum(1 for f in ws.get("floating", []) if f.get("state"))
+    if states:
+        extras.append(f"{states} opening fullscreen")
+    return "\n".join([f"{tiles} tile{'s' if tiles != 1 else ''}: {', '.join(names) if names else 'no apps'}"]
+                     + extras
+                     + [("Replaced the blueprint it had. " if previous else "") + where])
 
 
 def cmd_snapshot(args):
@@ -1067,7 +1180,8 @@ def cmd_snapshot(args):
             return fail(f"the focused workspace is not one of 1-{MAX_WORKSPACE_ID}")
         key = str(wsid)
     title = f"Workspace {key} was not saved"
-    windows = tiled_windows(int(key))
+    state = workspace_windows(int(key))
+    windows = state["tiled"]
     if not windows:
         notify(title, "It has no tiled windows to snapshot.")
         return fail(f"no tiled windows on workspace {key}")
@@ -1084,9 +1198,18 @@ def cmd_snapshot(args):
     # A new snapshot records the layout only. Pinning its apps here or starting them at login
     # changes where they open everywhere, so that stays a choice made in the editor.
     candidate = dict(doc["workspaces"])
-    candidate[key] = {"root": capture_tree(windows),
+    # The snapshot takes the whole workspace as it stands: the tiling, which windows float
+    # and where, and anything opened fullscreen or at full width.
+    tree = capture_tree(windows)
+    for leaf in leaves(tree):
+        for app in leaf["apps"]:
+            recorded = next((w.get("state") for w in windows if w["class"] == app["class"] and w.get("state")), "")
+            if recorded:
+                app["state"] = recorded
+    candidate[key] = {"root": tree,
                       "pin": previous["pin"] if previous else False,
-                      "launch": previous["launch"] if previous else False}
+                      "launch": previous["launch"] if previous else False,
+                      "floating": state["floating"]}
     try:
         saved, _ = normalize_document({"version": 1, "workspaces": candidate}, strict=True)
         blob = serialize_config(saved)

@@ -26,6 +26,7 @@ Item {
   readonly property int maxDocument: 512 * 1024
   readonly property int maxApps: 3000
   readonly property int maxWindows: 256
+  readonly property int maxFloating: 16   // matches the helper's ceiling
   readonly property int maxTiles: 64
   readonly property int maxAppsPerTile: 32
   readonly property int maxDepth: 16
@@ -493,16 +494,33 @@ Item {
     root.runHelper(captureProc, captureWatchdog, ["windows", String(root.workspace)])
   }
 
+  // One window from the helper's listing, or null: geometry it could not vouch for is
+  // dropped rather than guessed at.
+  function captureWindow(item) {
+    if (!item || !isFinite(item.x) || !isFinite(item.y) || !(Number(item.w) > 0) || !(Number(item.h) > 0)) return null
+    var out = { "class": String(item["class"] || ""), name: String(item.name || ""), desktop: String(item.desktop || ""),
+                x: Number(item.x), y: Number(item.y), w: Number(item.w), h: Number(item.h) }
+    if (item.state === "fullscreen" || item.state === "maximized") out.state = item.state
+    if (item.pinned === true) out.pinned = true
+    return out
+  }
+
   function finishCapture(raw, capturedWorkspace) {
     if (capturedWorkspace !== root.workspace) { root.status = ""; return }
-    var parsed = []
-    try { parsed = JSON.parse(raw) } catch (e) { parsed = [] }
+    var parsed = null
+    try { parsed = JSON.parse(raw) } catch (e) { parsed = null }
+    // The helper used to print a bare array of tiled windows and now prints both lists.
+    var tiled = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.tiled) ? parsed.tiled : [])
+    var loose = parsed && Array.isArray(parsed.floating) ? parsed.floating : []
     var windows = []
-    for (var n = 0; Array.isArray(parsed) && n < parsed.length && windows.length < root.maxWindows; n++) {
-      var item = parsed[n]
-      if (!item || !isFinite(item.x) || !isFinite(item.y) || !(Number(item.w) > 0) || !(Number(item.h) > 0)) continue
-      windows.push({ "class": String(item["class"] || ""), name: String(item.name || ""), desktop: String(item.desktop || ""),
-                     x: Number(item.x), y: Number(item.y), w: Number(item.w), h: Number(item.h) })
+    for (var n = 0; n < tiled.length && windows.length < root.maxWindows; n++) {
+      var one = root.captureWindow(tiled[n])
+      if (one) windows.push(one)
+    }
+    var floating = []
+    for (var f = 0; f < loose.length && floating.length < root.maxFloating; f++) {
+      var other = root.captureWindow(loose[f])
+      if (other) floating.push(other)
     }
     if (windows.length === 0) { root.status = "No tiled windows on workspace " + root.workspace + " to capture"; return }
     var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
@@ -516,8 +534,11 @@ Item {
     if (problem) { root.status = "Cannot capture: " + problem; return }
     var ws = Model.clone(root.current)
     ws.root = tree
-    root.commit(ws, Model.order(ws.root)[0],
-                "Captured " + windows.length + " window" + (windows.length === 1 ? "" : "s") + " from workspace " + root.workspace)
+    if (floating.length > 0) ws.floating = floating
+    else delete ws.floating
+    var note = "Captured " + windows.length + " window" + (windows.length === 1 ? "" : "s")
+    if (floating.length > 0) note += " and " + floating.length + " floating"
+    root.commit(ws, Model.order(ws.root)[0], note + " from workspace " + root.workspace)
   }
 
   function save() {
