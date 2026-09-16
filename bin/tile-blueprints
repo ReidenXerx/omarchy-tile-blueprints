@@ -15,8 +15,6 @@
   tile-blueprints active-workspace     the focused workspace id, as JSON
   tile-blueprints set-sizes <ws> <p>   store new shares ('s:path=a,b;w:path=a,b') in the
                                        blueprint; the layout engine calls this after a resize
-  tile-blueprints sync-layout          rewrite the layout file if it has drifted from the
-                                       blueprints (what a resize leaves behind), no reload
   tile-blueprints status               what is configured and whether Hyprland has it
   tile-blueprints remove               delete the generated layout file and reload
 
@@ -60,6 +58,10 @@ def _xdg(variable, default):
 CONFIG = _xdg("XDG_CONFIG_HOME", ".config") / "omarchy" / "tile-blueprints.json"
 STATE = _xdg("XDG_STATE_HOME", ".local/state") / "omarchy"
 GENERATED = STATE / "workspace-layouts" / "zz-tile-blueprints.lua"
+# The proportions, kept beside the layout file rather than in it. Hyprland watches every
+# file it loads, so writing this one costs nothing; the layout file reads it with a
+# data-only loader (no environment, so it can build tables and nothing else).
+TREES = STATE / "tile-blueprints" / "trees.lua"
 LAYOUT_NAME = "tile-blueprints"
 
 # Desktop entries, first directory wins. The user's own are read through plugin_safety;
@@ -557,6 +559,11 @@ def rules_outside_trees(text):
     return text[:start] + text[end:]
 
 
+def write_trees(doc):
+    """The proportions file the layout reads at start-up, kept in step with the document."""
+    safe.write_file(TREES, "return " + trees_lua(doc) + "\n", mode=0o644)
+
+
 def push_trees(doc):
     """Hand the running Hyprland the new trees and let the layout re-tile, with no config
     reload: seconds of re-reading every Omarchy file turn into about 30ms. The Lua is built
@@ -594,6 +601,15 @@ def generate(doc):
         TREES_OPEN,
         "__omarchy_tiles.workspaces = " + trees_lua(doc),
         TREES_CLOSE,
+        # Proportions a resize wrote since this file was generated. Loaded with no
+        # environment at all, so the file can only build a table - it cannot call anything.
+        f"local saved = io.open({lua_str(str(TREES))}, \"r\")",
+        "if saved then",
+        '  local chunk = load(saved:read("a"), "tile-blueprints trees", "t", {})',
+        "  saved:close()",
+        "  local ok, trees = pcall(chunk)",
+        "  if ok and type(trees) == \"table\" then __omarchy_tiles.workspaces = trees end",
+        "end",
         f"__omarchy_tiles.persist = {lua_str(str(SELF))}",
         "",
         f'hl.layout.register({lua_str(LAYOUT_NAME)}, {{',
@@ -736,7 +752,10 @@ def apply_document(doc):
     except (safe.UnsafeError, safe.TooLarge, OSError):
         previous = None
     if previous is not None and previous.decode("utf-8", "replace") == text:
-        # Nothing to write, so nothing to reload: the file already says this.
+        # Nothing to write and nothing to reload - but the running compositor may be holding
+        # proportions a resize changed since, so it still gets handed the document's.
+        push_trees(doc)
+        write_trees(doc)
         return [], arrange(doc)
     if previous is not None and rules_outside_trees(text) is not None:
         try:
@@ -748,8 +767,10 @@ def apply_document(doc):
         # already right, which is the part a person waits for.
         if same_rules and push_trees(doc):
             safe.write_file(GENERATED, text, mode=0o644)
+            write_trees(doc)
             return [], arrange(doc)
     safe.write_file(GENERATED, text, mode=0o644)
+    write_trees(doc)
     reload_hyprland()
     related = config_errors()
     return (related, 0) if related else ([], arrange(doc))
@@ -1337,37 +1358,17 @@ def cmd_set_sizes(args):
         blob = serialize_config(doc)
     except Invalid as e:
         return fail(f"set-sizes: {e}")
-    # Only the document. The layout file is what Hyprland watches, and rewriting it costs a
-    # full config reload, so `sync-layout` catches it up once the keys have stopped.
+    # Never the layout file: Hyprland watches that one and would re-read its whole config.
+    # The proportions file beside it is not watched, so this costs nothing and still
+    # survives a restart.
     safe.write_file(CONFIG, blob, mode=0o600)
-    return 0
-
-
-def cmd_sync_layout(_args):
-    """sync-layout - rewrite the layout file from the saved blueprints if it has drifted.
-
-    Called a few seconds after the last resize. Writing the file makes Hyprland re-read its
-    whole config, so an unchanged file is left exactly as it is."""
-    try:
-        doc, _ = load_config()
-    except Unreadable as e:
-        return fail(str(e))
-    if not doc["workspaces"]:
-        return 0
-    text = generate(doc)
-    try:
-        previous = safe.read_file(GENERATED, GENERATED_MAX)
-    except (safe.UnsafeError, safe.TooLarge, OSError):
-        previous = None
-    if previous is not None and previous.decode("utf-8", "replace") == text:
-        return 0
-    safe.write_file(GENERATED, text, mode=0o644)
+    write_trees(doc)
     return 0
 
 
 COMMANDS = {
     "open": cmd_open, "config": cmd_config, "write": cmd_write, "apply": cmd_apply, "arrange": cmd_arrange,
-    "set-sizes": cmd_set_sizes, "sync-layout": cmd_sync_layout,
+    "set-sizes": cmd_set_sizes,
     "windows": cmd_windows, "snapshot": cmd_snapshot, "apps": cmd_apps, "active-workspace": cmd_active_workspace,
     "status": cmd_status, "remove": cmd_remove,
 }

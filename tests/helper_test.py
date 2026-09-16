@@ -81,7 +81,7 @@ hl = {
   bind = function(keys, fn, opts) out[#out + 1] = "bind " .. hex(keys) end,
   unbind = function(keys) out[#out + 1] = "unbind " .. hex(keys) end,
   dispatch = function(d) out[#out + 1] = "dispatch" end,
-  dsp = { window = { resize = function(t) return t end } },
+  dsp = { window = { resize = function(t) return t end }, layout = function(msg) return msg end },
   timer = function(fn, opts) fn() return {} end,
   get_active_window = function() return nil end,
 }
@@ -93,6 +93,17 @@ local function walk(key, node)
     for _, app in ipairs(node.apps) do out[#out + 1] = "app " .. key .. " " .. hex(app) end
   end
 end
+local sizes = io.open((path:gsub("generated%.lua$", "sizes.txt")), "w")
+local function dump(node)
+  if node.children then
+    sizes:write(table.concat(node.sizes or {}, ","), "\n")
+    for _, child in ipairs(node.children) do dump(child) end
+  elseif node.shares then
+    sizes:write(table.concat(node.shares, ","), "\n")
+  end
+end
+for _, root in pairs(__omarchy_tiles.workspaces) do dump(root) end
+sizes:close()
 for key, root in pairs(__omarchy_tiles.workspaces) do walk(key, root) end
 table.sort(out)
 io.write(table.concat(out, "\n"), "\n")
@@ -101,7 +112,7 @@ io.write(table.concat(out, "\n"), "\n")
 
 LUA_RESIZE_HARNESS = r"""
 local path, classes, active, axis, delta, times = ...
-local registered, exec, timers = nil, {}, {}
+local registered, exec, timers, dispatched = nil, {}, {}, {}
 ACTIVE = nil
 hl = {
   layout = { register = function(name, t) registered = t end },
@@ -111,8 +122,8 @@ hl = {
   exec_cmd = function(cmd) exec[#exec + 1] = cmd end,
   bind = function() end,
   unbind = function() end,
-  dispatch = function() end,
-  dsp = { window = { resize = function(t) return t end } },
+  dispatch = function(d) dispatched[#dispatched + 1] = tostring(d) end,
+  dsp = { window = { resize = function(t) return t end }, layout = function(msg) return msg end },
   timer = function(fn) timers[#timers + 1] = fn return {} end,
   get_active_window = function() return ACTIVE end,
 }
@@ -146,6 +157,7 @@ for i, target in ipairs(targets) do
   io.write("box ", i, " ", target.box.x, " ", target.box.y, " ", target.box.w, " ", target.box.h, "\n")
 end
 for _, cmd in ipairs(exec) do io.write("exec ", cmd, "\n") end
+for _, d in ipairs(dispatched) do io.write("dispatch ", d, "\n") end
 """
 
 
@@ -158,6 +170,7 @@ class Sandbox(unittest.TestCase):
         h.CONFIG = self.dir / "config" / "omarchy" / "tile-blueprints.json"
         h.STATE = self.dir / "state" / "omarchy"
         h.GENERATED = h.STATE / "workspace-layouts" / "zz-tile-blueprints.lua"
+        h.TREES = h.STATE / "tile-blueprints" / "trees.lua"
         h.USER_APP_DIRS = [h.HOME / ".local/share/applications",
                            h.HOME / ".local/share/flatpak/exports/share/applications"]
         h.SYSTEM_APP_DIRS = []
@@ -458,17 +471,23 @@ class Resize(Sandbox):
     def test_the_only_program_the_generated_file_names_is_the_helper(self):
         text = self.h.generate(self.h.normalize_document(document(w1=leaf(["foot"])), strict=True)[0])
         execs = [line.strip() for line in text.splitlines() if "hl.exec_cmd(" in line]
-        self.assertEqual(len(execs), 2)                       # the two calls back into this helper
+        self.assertEqual(len(execs), 1)                       # the one call back into this helper
         for line in execs:
             self.assertIn("hl.exec_cmd(command ..", line)   # always this helper, never a name from the document
         self.assertIn(f'__omarchy_tiles.persist = "{self.h.SELF}"', text)
 
-    def test_a_run_of_resizes_saves_once_and_syncs_once(self):
+    def test_a_resize_asks_hyprland_to_lay_the_workspace_out_again(self):
+        out = self.resize_run(document(w1=self.split()), "foot,code", 1, "x", -100)
+        self.assertIn("dispatch reload", out)   # without this the change waits for something else
+
+    def test_a_refused_resize_asks_for_nothing(self):
+        out = self.resize_run(document(w1=self.split()), "foot,code", 1, "y", -100)
+        self.assertNotIn("dispatch", out)
+
+    def test_a_run_of_resizes_saves_once(self):
         out = self.resize_run(document(w1=self.split()), "foot,code", 1, "x", -20, times=5)
         saves = [line for line in out.splitlines() if "set-sizes" in line]
-        syncs = [line for line in out.splitlines() if "sync-layout" in line]
-        self.assertEqual(len(saves), 1, out)      # one write of the document for the whole run
-        self.assertEqual(len(syncs), 1, out)      # and one catch-up of the layout file
+        self.assertEqual(len(saves), 1, out)      # one write for the whole run
         self.assertIn("0.4000,0.6000", saves[0])  # carrying where the border ended up
 
     # ---- applying without a full reload
@@ -519,6 +538,18 @@ class Resize(Sandbox):
         self.assertEqual([c[0] for c in self.calls], ["eval"])
         self.assertEqual(self.spawned, [True])
 
+    def test_an_apply_that_changes_nothing_still_resets_what_a_resize_moved(self):
+        self.write_config(document(w1=self.split()))
+        self.capture(self.h.cmd_apply, [])
+        self.capture(self.h.cmd_set_sizes, ["1", "s:=0.2,0.8"])     # as a resize would
+        self.write_config(document(w1=self.split()))                 # the editor saves the old shares back
+        self.calls.clear()
+        self.capture(self.h.cmd_apply, [])
+        commands = [c[0] for c in self.calls]
+        self.assertIn("eval", commands)           # the live layout is put back in step
+        self.assertNotIn("reload", commands)
+        self.assertIn("0.5", self.h.TREES.read_text())
+
     def test_a_first_apply_reloads_because_there_is_nothing_to_compare(self):
         self.write_config(document(w1=self.split()))
         self.capture(self.h.cmd_apply, [])
@@ -566,20 +597,42 @@ class Resize(Sandbox):
         self.assertEqual(self.h.GENERATED.read_bytes(), before)   # no write, so no auto-reload
         self.assertEqual(self.calls, [])
 
-    def test_sync_layout_catches_the_file_up_once(self):
+    def test_a_resize_writes_the_proportions_file_instead(self):
         self.write_config(document(w1=self.split()))
         self.capture(self.h.cmd_apply, [])
-        self.capture(self.h.cmd_set_sizes, ["1", "s:=0.3,0.7"])
-        before = self.h.GENERATED.read_bytes()
+        layout = self.h.GENERATED.read_bytes()
         self.calls.clear()
-        self.assertEqual(self.capture(self.h.cmd_sync_layout, [])[0], 0)
-        after = self.h.GENERATED.read_bytes()
-        self.assertNotEqual(after, before)
-        self.assertIn(b"0.3", after)
-        self.assertEqual(self.calls, [])                          # it never reloads by itself
-        stamp = self.h.GENERATED.stat().st_mtime_ns
-        self.assertEqual(self.capture(self.h.cmd_sync_layout, [])[0], 0)
-        self.assertEqual(self.h.GENERATED.stat().st_mtime_ns, stamp)   # already in step: left alone
+        self.capture(self.h.cmd_set_sizes, ["1", "s:=0.3,0.7"])
+        self.assertEqual(self.h.GENERATED.read_bytes(), layout)    # the watched file is untouched
+        trees = self.h.TREES.read_text()
+        self.assertTrue(trees.startswith("return "))
+        self.assertIn("0.3", trees)
+        self.assertEqual(self.calls, [])
+
+    def test_the_layout_file_reads_the_proportions_back(self):
+        self.write_config(document(w1=self.split()))
+        self.capture(self.h.cmd_apply, [])
+        self.capture(self.h.cmd_set_sizes, ["1", "s:=0.25,0.75"])
+        path = self.dir / "generated.lua"
+        path.write_text(self.h.GENERATED.read_text())
+        harness = self.dir / "harness.lua"
+        harness.write_text(LUA_HARNESS)
+        r = self.lua("lua", str(harness), str(path))
+        self.assertTrue(r.ok, r.stderr.decode())
+        self.assertIn("0.25", (self.dir / "sizes.txt").read_text())
+
+    def test_a_proportions_file_that_is_nonsense_is_ignored(self):
+        self.write_config(document(w1=self.split()))
+        self.capture(self.h.cmd_apply, [])
+        for junk in ("return os.exit()", "this is not lua", "return 5", ""):
+            self.h.TREES.write_text(junk)
+            path = self.dir / "generated.lua"
+            path.write_text(self.h.GENERATED.read_text())
+            harness = self.dir / "harness.lua"
+            harness.write_text(LUA_HARNESS)
+            r = self.lua("lua", str(harness), str(path))
+            self.assertTrue(r.ok, junk + ": " + r.stderr.decode())
+            self.assertIn("0.5", (self.dir / "sizes.txt").read_text(), junk)
 
     def test_set_sizes_refuses_what_it_cannot_read(self):
         self.write_config(document(w1=self.split()))

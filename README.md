@@ -111,10 +111,12 @@ or at login until you turn that on in the editor.
 
 `SUPER + -` and `SUPER + =` resize the focused window, in four steps: alone for 100px, with
 `ALT` for 25, with `CTRL` for 300, and with `SHIFT` for the vertical border instead of the
-horizontal one. **The new proportion is saved into the blueprint**, about half a second
-after you stop pressing, so the workspace opens that way next time. A whole run of
-keystrokes costs one write, and the layout file Hyprland watches is brought back in step a
-few seconds later, so a burst of resizing never turns into a burst of config reloads. Nothing else in the
+horizontal one. The window moves at once, and **the new proportion is saved into the
+blueprint** about half a second after you stop pressing, so the workspace opens that way
+next time. A whole run of keystrokes costs one write, and none of it reloads your config:
+the proportions live in `~/.local/state/omarchy/tile-blueprints/trees.lua`, beside the
+layout file rather than in it, because Hyprland re-reads every config file whenever one it
+loaded changes. Nothing else in the
 blueprint changes, and resizing back is the undo.
 
 It works both between tiles and between windows that share one tile. A border stops rather
@@ -195,6 +197,10 @@ unparseable, because a malformed menu file silently disables **every** user entr
   System desktop entries are read only when they are root-owned regular files that really
   live under `/usr/share`, `/usr/local/share`, `/usr/lib` or `/var/lib/flatpak` (64 KB
   each, at most 3000 apps).
+- **The proportions file is data, not code.** A resize writes
+  `~/.local/state/omarchy/tile-blueprints/trees.lua`, which the layout file loads with
+  `load(..., "t", {})` - no environment at all, so the chunk can build a table and nothing
+  else; anything that is not a table is ignored and the blueprint's own proportions stand.
 - **The blueprint file is untrusted input.** It is capped at 512 KB and normalized before
   any Lua is generated: workspaces 1–99 (at most 10), 64 tiles and 16 split levels per
   workspace, 32 apps per tile, class names up to 256 characters without control
