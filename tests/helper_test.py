@@ -74,7 +74,7 @@ local out = {}
 local function hex(s) return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end)) end
 hl = {
   layout = { register = function(name, t) out[#out + 1] = "layout " .. hex(name) end },
-  workspace_rule = function(t) out[#out + 1] = "wsrule " .. hex(t.workspace) .. " " .. hex(t.layout) end,
+  workspace_rule = function(t) out[#out + 1] = "wsrule " .. hex(tostring(t.workspace)) .. " " .. hex(tostring(t.layout)) .. " " .. hex(tostring(t.monitor or "")) .. " " .. hex(tostring(t.persistent == true)) end,
   window_rule = function(t) out[#out + 1] = "rule " .. hex(t.match.class) .. " " .. hex(t.workspace) end,
   on = function(event, fn) out[#out + 1] = "on " .. hex(event); fn() end,
   exec_cmd = function(cmd) out[#out + 1] = "exec " .. hex(cmd) end,
@@ -187,6 +187,7 @@ class Sandbox(unittest.TestCase):
         self.calls, self.notes, self.spawned = [], [], []
         self.eval_ok = True
         self.clients, self.active = [], {"id": 1}
+        self.monitors = []
         h.hyprctl = self.fake_hyprctl
         h.notify = lambda summary, body="": self.notes.append((summary, body))
         h.spawn_apply = lambda: (self.spawned.append(True), 0)[1]
@@ -203,6 +204,8 @@ class Sandbox(unittest.TestCase):
             payload = json.dumps(self.clients).encode()
         elif args == ["-j", "activeworkspace"]:
             payload = json.dumps(self.active).encode()
+        elif args == ["-j", "monitors"]:
+            payload = json.dumps(self.monitors).encode()
         elif args == ["-j", "workspaces"]:
             payload = b"[]"
         elif args and args[0] == "eval":
@@ -326,6 +329,19 @@ class Normalize(Sandbox):
             with self.assertRaises(self.h.Invalid):
                 self.h.normalize_document(bad, strict=True)
 
+    def test_monitor_is_kept_only_when_it_is_a_usable_rule_value(self):
+        good = ["desc:Dell Inc. DELL S2721DGF DCRD223", "DP-1", "0", "desc:a,b (c)+d-1"]
+        for value in good:
+            doc = document(w1=leaf(["a"]))
+            doc["workspaces"]["1"]["monitor"] = value
+            self.assertEqual(self.strict(doc)["workspaces"]["1"]["monitor"], value)
+        # Anything that is not a printable string, or is too long, is dropped rather than
+        # rejected: the workspace keeps its blueprint and just opens wherever it is.
+        for bad in ("", "   ", "a\nb", "a\tb", "x" * 257, "\x00", 7, None, ["DP-1"], {"a": 1}):
+            doc = document(w1=leaf(["a"]))
+            doc["workspaces"]["1"]["monitor"] = bad
+            self.assertNotIn("monitor", self.strict(doc)["workspaces"]["1"], repr(bad))
+
 
 # ------------------------------------------------------------------ Lua
 
@@ -380,6 +396,27 @@ class Lua(Sandbox):
         text = self.h.generate(self.h.normalize_document(doc, strict=True)[0])
         self.assertNotIn("hl.window_rule", text)
         self.assertNotIn("gtk-launch", text)
+
+    def test_display_rule_is_persistent_and_escaped(self):
+        monitor = 'desc:Dell "Inc" \\ 27in'
+        doc = document(w3=leaf(["foot"]))
+        doc["workspaces"]["3"]["monitor"] = monitor
+        normalized = self.h.normalize_document(doc, strict=True)[0]
+        self.assertEqual(normalized["workspaces"]["3"]["monitor"], monitor)
+        text = self.h.generate(normalized)
+        self.assertIn("persistent = true", text)
+        path = self.dir / "generated.lua"
+        path.write_text(text)
+        self.assertTrue(self.lua("luac", "-p", str(path)).ok)
+        harness = self.dir / "harness.lua"
+        harness.write_text(LUA_HARNESS)
+        r = self.lua("lua", str(harness), str(path))
+        self.assertTrue(r.ok, r.stderr.decode())
+        lines = set(r.text().split("\n")[:-1])
+        self.assertIn(f"wsrule {hexed('3')} {hexed('lua:tile-blueprints')} {hexed(monitor)} {hexed('true')}", lines)
+        # A workspace with no display chosen gets no monitor at all, so Hyprland places it.
+        plain = self.h.generate(self.h.normalize_document(document(w4=leaf(["foot"])), strict=True)[0])
+        self.assertNotIn("monitor =", plain)
 
     def test_no_launch_lines_without_trusted_tools(self):
         self.h.launch_tools = lambda: None
@@ -1308,6 +1345,38 @@ class Snapshot(Sandbox):
         self.assertEqual((saved["3"]["pin"], saved["3"]["launch"]), (True, False))
         self.assertNotIn('"old"', json.dumps(saved["3"]))
         self.assertIn("Replaced", self.notes[-1][1])
+
+    def test_monitors_lists_displays_and_prefers_the_stable_description(self):
+        self.monitors = [
+            {"name": "DP-1", "description": "Dell Inc. DELL S2721DGF DCRD223", "width": 2560, "height": 1440,
+             "activeWorkspace": {"id": 1}},
+            {"name": "DP-2", "description": "", "width": 1920, "height": 1080, "activeWorkspace": {"id": 2}},
+            {"name": "HDMI-A-1", "description": "Odd\u2122 Panel", "width": 1280, "height": 720},
+            {"name": "", "description": "nameless"},
+        ]
+        code, out, err = self.capture(self.h.cmd_monitors, [])
+        self.assertEqual(code, 0, err)
+        got = json.loads(out)
+        self.assertEqual([m["rule"] for m in got],
+                         ["desc:Dell Inc. DELL S2721DGF DCRD223", "DP-2", "HDMI-A-1"])
+        self.assertEqual([m["workspace"] for m in got], [1, 2, 0])
+        self.assertEqual(got[0]["width"], 2560)
+
+    def test_monitors_fails_when_hyprland_cannot_answer(self):
+        self.h.hypr_json = lambda *args: None
+        self.assertEqual(self.capture(self.h.cmd_monitors, [])[0], 1)
+        self.assertEqual(self.capture(self.h.cmd_monitors, ["1"])[0], 2)
+
+    def test_snapshot_keeps_the_display_already_chosen(self):
+        doc = document(w2=leaf(["foot"]))
+        doc["workspaces"]["2"]["monitor"] = "desc:Dell Inc. DELL S2721DGF DCRD223"
+        self.write_config(doc)
+        self.clients = self.arranged(ws=3)
+        code, _, err = self.capture(self.h.cmd_snapshot, ["3"])
+        self.assertEqual(code, 0, err)
+        saved = json.loads(self.h.CONFIG.read_text())["workspaces"]
+        self.assertEqual(saved["2"]["monitor"], "desc:Dell Inc. DELL S2721DGF DCRD223")
+        self.assertNotIn("monitor", saved["3"])   # a new snapshot records the layout only
 
     def test_snapshot_refusals_change_nothing(self):
         self.write_config(document(w2=leaf(["foot"])))

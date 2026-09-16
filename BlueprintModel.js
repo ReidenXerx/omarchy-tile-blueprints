@@ -458,11 +458,50 @@ function normalizeFile(parsed) {
       launch: ws.launch !== false,
       pin: ws.pin !== false
     }
+    var monitor = normalizeMonitor(ws.monitor)
+    if (monitor !== "") space.monitor = monitor
     var floating = normalizeFloating(ws.floating)
     if (floating.length > 0) space.floating = floating
     out.workspaces[key] = space
   }
   return out
+}
+
+// The display a workspace opens on: "" for wherever Hyprland puts it, otherwise an output
+// name or a desc: description. The helper validates the saved file; this keeps the editor's
+// own copy to the same shape.
+function normalizeMonitor(value) {
+  // Same rule as the helper: an output name or desc: description, printable and bounded.
+  if (typeof value !== "string") return ""
+  var text = value.trim()
+  return /^[ -~]{1,256}$/.test(text) ? text : ""
+}
+
+// ---------------------------------------------------------------- displays
+
+var MONITOR_ANY = "any display"
+
+// The chip's label: the display's own name when the list knows the rule, the rule otherwise.
+function monitorLabel(monitor, list) {
+  if (!monitor) return MONITOR_ANY
+  if (Array.isArray(list)) {
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].rule === monitor) return String(list[i].name || monitor)
+    }
+  }
+  return String(monitor)
+}
+
+// Cycling the chip: any display, then each connected one, then back.
+function nextMonitor(monitor, list) {
+  var options = [""]
+  if (Array.isArray(list)) {
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && typeof list[i].rule === "string" && list[i].rule !== "") options.push(list[i].rule)
+    }
+  }
+  var at = options.indexOf(monitor || "")
+  return options[(at + 1) % options.length]
 }
 
 function appCount(root) {
@@ -496,7 +535,8 @@ function stableJson(value) {
 }
 
 function savedForm(ws) {
-  return isMeaningful(ws) ? stableJson({ root: ws.root, launch: ws.launch !== false, pin: ws.pin !== false }) : ""
+  return isMeaningful(ws) ? stableJson({ root: ws.root, launch: ws.launch !== false, pin: ws.pin !== false,
+                                         monitor: ws.monitor || "" }) : ""
 }
 
 // Workspace numbers, ascending, whose blueprint in draft is not what saved holds. A workspace

@@ -25,6 +25,7 @@ Item {
   readonly property int maxHelperOutput: 4 * 1024 * 1024
   readonly property int maxDocument: 512 * 1024
   readonly property int maxApps: 3000
+  readonly property int maxMonitors: 16   // matches the helper's ceiling
   readonly property int maxWindows: 256
   readonly property int maxFloating: 16   // matches the helper's ceiling
   readonly property int maxTiles: 64
@@ -64,6 +65,8 @@ Item {
   property bool closeAfterSave: false
 
   property var apps: []
+  // The connected displays, from the helper: { name, description, rule, width, height, workspace }.
+  property var monitors: []
   property bool pickerOpen: false
   property string pickerQuery: ""
   property int pickerIndex: 0
@@ -83,6 +86,7 @@ Item {
   property real dragY: 0
 
   readonly property var current: draft.workspaces[String(workspace)] || Model.defaultWorkspace()
+  readonly property string monitorLabel: Model.monitorLabel(current.monitor, monitors)
   readonly property var geometry: Model.layout(current.root, { x: 0, y: 0, w: view ? view.canvasWidth : 0, h: view ? view.canvasHeight : 0 })
   readonly property var selectedTile: Model.findLeaf(current.root, selected)
   readonly property var pickerApps: filterApps(apps, pickerQuery)
@@ -118,6 +122,7 @@ Item {
     else { root.showWorkspace(root.workspace); root.runHelper(activeWorkspaceProc, activeWorkspaceWatchdog, ["active-workspace"]) }
     root.runHelper(configProc, configWatchdog, ["config"])
     root.runHelper(appsProc, appsWatchdog, ["apps"])
+    root.runHelper(monitorsProc, monitorsWatchdog, ["monitors"])
     Qt.callLater(function() { root.focusKeys() })
   }
 
@@ -263,6 +268,21 @@ Item {
     }
   }
   Watchdog { id: appsWatchdog; target: appsProc; limit: 20000 }
+
+  Process {
+    id: monitorsProc
+    stdout: StdioCollector { id: monitorsOut; waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      var list = []
+      if (root.helperOk(monitorsWatchdog, exitCode, exitStatus)) {
+        try { list = JSON.parse(root.helperText(monitorsOut)) } catch (e) { list = [] }
+      }
+      // No displays listed (Hyprland busy): the chip then offers only "any display".
+      root.monitors = Array.isArray(list) ? list.slice(0, root.maxMonitors) : []
+    }
+  }
+  Watchdog { id: monitorsWatchdog; target: monitorsProc; limit: 10000 }
 
   Process {
     id: activeWorkspaceProc
@@ -509,6 +529,18 @@ Item {
     root.commit(ws, root.selected, flag === "launch"
       ? (ws.launch ? "Apps here launch at login" : "Apps here no longer launch at login")
       : (ws.pin ? "Apps here always open on this workspace" : "Apps here open wherever you launch them"))
+  }
+
+  // The display this workspace's blueprint opens on, cycled: any display, then each connected
+  // one. Empty means no rule at all, which leaves Hyprland to place it as it always did.
+  function cycleMonitor() {
+    var ws = Model.clone(root.current)
+    var next = Model.nextMonitor(ws.monitor, root.monitors)
+    if (next === "") delete ws.monitor
+    else ws.monitor = next
+    root.commit(ws, root.selected, next === ""
+      ? "Workspace " + root.workspace + " opens on whichever display it is on"
+      : "Workspace " + root.workspace + " opens on " + Model.monitorLabel(next, root.monitors))
   }
 
   function clearWorkspace() {
@@ -781,6 +813,7 @@ Item {
     else if (k === Qt.Key_C) root.startCapture()
     else if (k === Qt.Key_P) root.toggleFlag("pin")
     else if (k === Qt.Key_O) root.toggleFlag("launch")
+    else if (k === Qt.Key_M) root.cycleMonitor()
     else handled = false
 
     if (handled) event.accepted = true
