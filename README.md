@@ -114,6 +114,9 @@ or at login until you turn that on in the editor.
 - **Unlisted windows share the largest tile.** Several windows in one tile split it evenly
   along its longer side, until you resize one.
 - **Workspaces without a blueprint are untouched** and keep whatever layout they had.
+- **A class is matched without regard to case.** A card added from the installed-app list can
+  carry the desktop id (`spotify`) while the window calls itself `Spotify`, and the window
+  rule still catches it.
 
 ## Which display a workspace opens on
 

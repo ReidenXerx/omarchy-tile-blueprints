@@ -111,6 +111,7 @@ MAX_TEXT = 256                    # class and name length
 MAX_PROBLEMS = 20
 MAX_COORDINATE = 1_000_000
 HYPR_TIMEOUT = 5.0
+LAUNCH_TIMEOUT = 120.0           # an app may take its time registering before uwsm-app returns
 HYPR_OUTPUT_MAX = 4 * 1024 * 1024
 RELOAD_TIMEOUT = 15.0
 ARRANGE_BUDGET = 20.0             # seconds for all the moves of one arrange
@@ -479,7 +480,10 @@ def engine_tree(node):
 
 
 def class_regex(cls):
-    return "^" + re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", cls) + "$"
+    """A window rule matches this app by class. Case-insensitively, like the layout engine
+    does: a card added from the installed-app list can carry the desktop id ("spotify") while
+    the window calls itself something else ("Spotify"), and the rule has to still catch it."""
+    return "(?i)^" + re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", cls) + "$"
 
 
 def read_engine():
@@ -890,7 +894,7 @@ def cmd_launch(args):
     started = 0
     for desktop in desktops:
         try:
-            spawn([uwsm_app, "--", gtk_launch, desktop + ".desktop"])
+            spawn([uwsm_app, "--", gtk_launch, desktop + ".desktop"], timeout=LAUNCH_TIMEOUT)
         except (safe.UnsafeError, OSError) as e:
             print(f"skipped {clean_text(desktop, 200)}: {e}", file=sys.stderr)
             continue

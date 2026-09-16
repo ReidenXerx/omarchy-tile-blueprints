@@ -389,6 +389,10 @@ class Lua(Sandbox):
             pattern = self.h.class_regex(cls)
             self.assertTrue(re.fullmatch(pattern, cls), cls)
         self.assertFalse(re.fullmatch(self.h.class_regex("a.b"), "aXb"))
+        # A class the desktop id spelled differently still matches: a card can say "spotify"
+        # while the window calls itself "Spotify".
+        self.assertTrue(re.fullmatch(self.h.class_regex("spotify"), "Spotify"))
+        self.assertFalse(re.fullmatch(self.h.class_regex("spotify"), "spotifyd"))
 
     def test_pin_and_launch_flags(self):
         doc = document(w1=leaf([{"class": "foot", "name": "Foot", "desktop": "foot"}]))
@@ -774,10 +778,11 @@ class FullSnapshot(Sandbox):
                                                "x": 100, "y": 200, "w": 640, "h": 480, "pinned": True,
                                                "state": "maximized"}]
         text = self.h.generate(self.h.normalize_document(doc, strict=True)[0])
-        self.assertIn('hl.window_rule({ match = { class = "^code$" }, fullscreen = true })', text)
-        self.assertIn('hl.window_rule({ match = { class = "^mpv$" }, float = true, move = "100 200", '
+        self.assertIn(f'hl.window_rule({{ match = {{ class = {self.h.lua_str(self.h.class_regex("code"))} }}, '
+                      'fullscreen = true })', text)
+        self.assertIn('hl.window_rule({ match = { class = ' + self.h.lua_str(self.h.class_regex("mpv")) + ' }, float = true, move = "100 200", '
                       'size = "640 480", pin = true, workspace = "1 silent" })', text)
-        self.assertIn('hl.window_rule({ match = { class = "^mpv$" }, maximize = true })', text)
+        self.assertIn('hl.window_rule({ match = { class = ' + self.h.lua_str(self.h.class_regex("mpv")) + ' }, maximize = true })', text)
 
     def test_floating_windows_are_checked_like_everything_else(self):
         doc = document(w1=leaf([{"class": "code", "name": "Code", "desktop": ""}]))
