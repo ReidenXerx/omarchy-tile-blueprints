@@ -193,7 +193,7 @@ Item {
 
   function runHelper(proc, watchdog, args) {
     if (proc.running) return false
-    proc.command = [root.python, root.helper].concat(args)
+    proc.command = [root.python, "-I", root.helper].concat(args)
     proc.running = true
     watchdog.arm()
     return true
@@ -232,8 +232,25 @@ Item {
       root.status = "Skipped part of the saved blueprints: " + String(problems[0]).slice(0, 200)
   }
 
+  // A child process starts with whatever the shell was started with, and the shell is
+  // long-lived, so LD_PRELOAD, PYTHONPATH and PYTHONHOME would all reach an interpreter
+  // this plugin then trusts. Each helper is handed an explicit environment instead, and
+  // python runs isolated on top of it (-I); the helper puts its own directory on sys.path
+  // itself, so nothing depends on -P's default.
+  readonly property var childEnv: {
+    const env = { "PATH": "/usr/bin:/bin", "PYTHONIOENCODING": "utf-8" }
+    for (const name of ["HOME", "LANG", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME",
+                        "HYPRLAND_INSTANCE_SIGNATURE"]) {
+      const value = Quickshell.env(name)
+      if (value) env[name] = value
+    }
+    return env
+  }
+
   Process {
     id: configProc
+    clearEnvironment: true
+    environment: root.childEnv
     stdout: StdioCollector { id: configOut; waitForEnd: true }
     stderr: StdioCollector { id: configErr; waitForEnd: true }
     onExited: function(exitCode, exitStatus) {
@@ -252,6 +269,8 @@ Item {
 
   Process {
     id: appsProc
+    clearEnvironment: true
+    environment: root.childEnv
     stdout: StdioCollector { id: appsOut; waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode, exitStatus) {
@@ -266,6 +285,8 @@ Item {
 
   Process {
     id: activeWorkspaceProc
+    clearEnvironment: true
+    environment: root.childEnv
     stdout: StdioCollector { id: activeWorkspaceOut; waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode, exitStatus) {
@@ -280,6 +301,8 @@ Item {
 
   Process {
     id: captureProc
+    clearEnvironment: true
+    environment: root.childEnv
     property int targetWorkspace: 0
     stdout: StdioCollector { id: captureOut; waitForEnd: true }
     stderr: StdioCollector { id: captureErr; waitForEnd: true }
@@ -296,6 +319,8 @@ Item {
   // Process.write() cannot close stdin; the helper reads up to the newline.
   Process {
     id: saveProc
+    clearEnvironment: true
+    environment: root.childEnv
     property string payload: ""
     stdinEnabled: true
     stdout: StdioCollector { waitForEnd: true }
