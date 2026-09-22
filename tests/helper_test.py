@@ -1381,7 +1381,10 @@ class Packaging(unittest.TestCase):
                 self.assertNotIn("Process", text, path.name)
         qml = (ROOT / "TileBlueprints.qml").read_text()
         for required in ('readonly property string python: "/usr/bin/python3"',
-                         "proc.command = [root.python, root.helper].concat(args)",
+                         # The -I is load-bearing, not incidental: it runs the helper isolated, so a
+                           # PYTHONPATH or PYTHONHOME inherited from the long-lived shell cannot
+                           # redirect the interpreter. Pinned here so it cannot be dropped quietly.
+                           'proc.command = [root.python, "-I", root.helper].concat(args)',
                          "stdinEnabled: true", '["write", "--background"]', '["active-workspace"]',
                          "target.signal(15)", "target.signal(9)"):
             self.assertTrue(required in qml, required)
