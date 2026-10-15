@@ -42,12 +42,16 @@ FocusScope {
     for (var i = 0; i < raw.length; i++) {
       var c = raw.charCodeAt(i)
       if (c === 10 || c === 13 || c === 9) clean += multiline && c === 10 ? raw[i] : (c === 13 ? "" : " ")
-      else if (c >= 32 && c !== 127 && c !== 0xfffd) clean += raw[i]
+      // Left out: control characters (C0, DEL, C1), the replacement character, line and paragraph separators, and
+      // the invisible marks that reorder text (bidi embeddings, overrides and isolates).
+      else if (c >= 32 && c !== 127 && !(c >= 0x80 && c <= 0x9f) && c !== 0xfffd
+               && !(c >= 0x2028 && c <= 0x202e) && !(c >= 0x2066 && c <= 0x2069)) clean += raw[i]
     }
-    var next = (field.text + clean).slice(0, Math.max(0, maximumLength))
-    var last = next.charCodeAt(next.length - 1)
-    if (last >= 0xd800 && last <= 0xdbff) next = next.slice(0, -1)
-    field.text = next
+    // Only what is added is cut to fit: text already there (a long saved value) is never shortened by a keystroke.
+    var add = clean.slice(0, Math.max(0, maximumLength - field.text.length))
+    var last = add.charCodeAt(add.length - 1)
+    if (last >= 0xd800 && last <= 0xdbff) add = add.slice(0, -1)
+    if (add) field.text = field.text + add
   }
 
   function dropChar(s) {
@@ -62,6 +66,14 @@ FocusScope {
     while (end > 0 && s[end - 1] === " ") end--
     while (end > 0 && s[end - 1] !== " ") end--
     return s.slice(0, end)
+  }
+
+  function consumes(event) {
+    var k = event.key
+    if ([Qt.Key_Delete, Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Home, Qt.Key_End].indexOf(k) >= 0)
+      return true
+    return (event.modifiers & Qt.ControlModifier) !== 0
+      && [Qt.Key_A, Qt.Key_C, Qt.Key_X, Qt.Key_Z, Qt.Key_Y, Qt.Key_U, Qt.Key_K, Qt.Key_W].indexOf(k) >= 0
   }
 
   function paste() {}
@@ -93,6 +105,10 @@ FocusScope {
                && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127) {
       event.accepted = true
       field.insert(event.text)
+    } else if (field.consumes(event)) {
+      // Keys a text field owns go no further, as with Qt's own fields: Delete, arrows, Home and End, and the Ctrl
+      // editing shortcuts must not reach whatever is behind the field (a list, a bar editor, a window's undo).
+      event.accepted = true
     }
   }
 
@@ -111,7 +127,7 @@ FocusScope {
     width: field.multiline ? field.width : implicitWidth
     // One line keeps its end in view, where the cursor is.
     x: field.multiline ? 0 : Math.min(0, field.width - caret.width - implicitWidth)
-    y: field.multiline ? 0 : (field.height - height) / 2
+    y: field.multiline ? Math.min(0, field.height - contentHeight) : (field.height - height) / 2
   }
 
   Text {
