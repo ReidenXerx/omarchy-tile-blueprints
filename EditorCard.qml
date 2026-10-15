@@ -652,19 +652,20 @@ BorderSurface {
             radius: tb.cornerRadius
             color: Util.alpha(tb.foreground, 0.07)
 
-            TextInput {
+            // Typed keys only: Qt's own text fields would read every new clipboard entry into the shell unbounded.
+            KeyField {
               id: pickerSearch
               anchors.fill: parent
               anchors.leftMargin: Style.spacing.lg
               anchors.rightMargin: Style.spacing.lg
-              verticalAlignment: TextInput.AlignVCenter
               color: tb.foreground
+              placeholderColor: Qt.rgba(tb.foreground.r, tb.foreground.g, tb.foreground.b, 0.45)
+              placeholderText: "App for this tile…"
+              maximumLength: 100
               font.family: tb.fontFamily
               font.pixelSize: Style.font.body
-              clip: true
               onTextChanged: { tb.pickerQuery = text; tb.pickerIndex = 0 }
-              Keys.priority: Keys.BeforeItem
-              Keys.onPressed: function(event) {
+              keyFilter: function(event) {
                 var count = tb.pickerApps.length
                 if (event.key === Qt.Key_Escape) { tb.pickerOpen = false; keys.forceActiveFocus() }
                 else if (event.key === Qt.Key_Down) { tb.pickerIndex = Math.min(count - 1, tb.pickerIndex + 1); appList.positionViewAtIndex(tb.pickerIndex, ListView.Contain) }
@@ -672,17 +673,6 @@ BorderSurface {
                 else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) tb.assignApp(tb.pickerApps[tb.pickerIndex])
                 else return
                 event.accepted = true
-              }
-
-              Text {
-                anchors.fill: parent
-                verticalAlignment: Text.AlignVCenter
-                visible: pickerSearch.text === ""
-                textFormat: Text.PlainText
-                text: "App for this tile…"
-                color: tb.foreground
-                opacity: 0.45
-                font: pickerSearch.font
               }
             }
           }

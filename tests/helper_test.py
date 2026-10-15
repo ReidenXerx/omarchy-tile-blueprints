@@ -1372,13 +1372,19 @@ class Packaging(unittest.TestCase):
 
     def test_qml_talks_only_to_the_helper(self):
         files = sorted(ROOT.glob("*.qml"))
-        self.assertEqual([p.name for p in files], ["EditorCard.qml", "EditorPanel.qml", "TileBlueprints.qml"])
+        self.assertEqual([p.name for p in files], ["EditorCard.qml", "EditorPanel.qml", "KeyField.qml", "TileBlueprints.qml"])
         for path in files:
             text = path.read_text()
             for forbidden in ('"hyprctl"', "execDetached", "FileView", "bash", '"sh"', "command:"):
                 self.assertFalse(forbidden in text, (path.name, forbidden))
             if path.name != "TileBlueprints.qml":
                 self.assertNotIn("Process", text, path.name)
+        # The app picker's text field draws typed keys itself: no native text control, which would read every new
+        # clipboard entry into the shared shell, and no paste.
+        for path in files:
+            for native in ("TextInput {", "TextEdit {", "TextField {", "TextArea {"):
+                self.assertNotIn(native, path.read_text(), path.name)
+        self.assertIn("function paste() {}", (ROOT / "KeyField.qml").read_text())
         qml = (ROOT / "TileBlueprints.qml").read_text()
         for required in ('readonly property string python: "/usr/bin/python3"',
                          # The -I is load-bearing, not incidental: it runs the helper isolated, so a
